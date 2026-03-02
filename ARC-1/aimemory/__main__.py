@@ -10,8 +10,9 @@ from aimemory.support_bundle import build_support_bundle
 from aimemory.consistency import run_consistency_check
 from aimemory.control_plane import PolicyStore, build_fleet_report
 from aimemory.agent import run_agent
-from aimemory.static_plan import StaticPlanCompiler, model_fingerprint
+from aimemory.static_plan import StaticPlanCompiler, model_fingerprint_full
 from aimemory.distributed_coord import RankCoordinator
+from aimemory.topology import detect_topology
 
 def main():
     p = argparse.ArgumentParser(prog="aimemory")
@@ -93,6 +94,7 @@ def main():
     spc.add_argument("--restore-order", default="1,2,3")
     spc.add_argument("--lookahead", type=int, default=4)
     spc.add_argument("--dtype", default="float16")
+    spc.add_argument("--world-size", type=int, default=1)
 
     sps = sub.add_parser("static-plan-show")
     sps.add_argument("--pool-dir", default="/mnt/nvme_pool")
@@ -186,7 +188,13 @@ def main():
         root = f"{args.pool_dir}/static_plans"
         comp = StaticPlanCompiler(root)
         order = [int(x.strip()) for x in str(args.restore_order).split(",") if x.strip()]
-        mfp = model_fingerprint(name=str(args.name), shape_sig=(len(order),), dtype_s=str(args.dtype))
+        mfp = model_fingerprint_full(
+            name=str(args.name),
+            shape_sig=(len(order),),
+            dtype_s=str(args.dtype),
+            world_size=int(args.world_size),
+            graph_key=str(args.name),
+        )
         plan = comp.compile_from_restore_order(mfp, order, int(args.lookahead))
         p = comp.save(plan)
         print(json.dumps({"plan_key": plan.plan_key, "path": p}, indent=2))
@@ -214,7 +222,9 @@ def main():
             "spills": args.spills,
             "memory_headroom_pct": args.headroom_pct,
             "safe_mode": False,
-        })
+            "step_p99_ms": 0.0,
+            "latency_attribution": {},
+        }, topology=detect_topology(rank=args.rank))
         cons = None
         if int(args.rank) == 0:
             cons = coord.leader_aggregate(args.step)

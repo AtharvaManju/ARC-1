@@ -17,9 +17,20 @@ class AIMemoryConfig:
     spill_queue_overflow_policy: str = "SYNC_SPILL"  # BLOCK | SYNC_SPILL | DISABLE_SPILLING
     pack_wait_for_commit: bool = False
     prefetch_batch_limit: int = 8
+    dynamic_prefetch_limit_min: int = 1
+    dynamic_prefetch_limit_max: int = 16
+    queue_soft_limit_ratio: float = 0.85
 
     pinned_pool_bytes: int = 2 * 1024**3
     prefetch_stream_priority: int = -1
+    inflight_spill_bytes_limit: int = 8 * 1024**3
+    inflight_prefetch_bytes_limit: int = 8 * 1024**3
+    per_step_spill_budget_bytes: int = 16 * 1024**3
+    per_window_spill_budget_bytes: int = 128 * 1024**3
+    spill_budget_window_steps: int = 50
+    fairness_per_step_bytes: int = 8 * 1024**3
+    nvme_write_bw_limit_mb_s: float = 0.0
+    nvme_read_bw_limit_mb_s: float = 0.0
 
     # PCC (unchanged logic; only config)
     pcc_lookahead: int = 4
@@ -47,6 +58,9 @@ class AIMemoryConfig:
     license_path: str = "/etc/aimemory/license.json"
 
     hard_fail_on_corruption: bool = True
+    strict_read_barrier: bool = True
+    stronger_payload_hash: bool = True
+    quarantine_on_corruption: bool = True
 
     rank: int = -1
     world_size: int = -1
@@ -87,6 +101,8 @@ class AIMemoryConfig:
     # Determinism / stream semantics
     deterministic_stream_fences: bool = True
     deterministic_io_ordering: bool = True
+    collective_safe_mode: bool = True
+    collective_cadence_steps: int = 1
 
     # Native runtime / hot path minimization
     native_performance_mode: bool = False
@@ -94,6 +110,8 @@ class AIMemoryConfig:
     native_max_batch_ops: int = 64
     native_flush_interval_ms: float = 0.25
     native_disable_python_callbacks: bool = False
+    native_chunk_bytes: int = 64 * 1024 * 1024
+    native_inflight_bytes_limit: int = 8 * 1024**3
 
     # Static spill plan / compile-capture
     static_plan_mode: bool = False
@@ -102,6 +120,8 @@ class AIMemoryConfig:
     static_plan_auto_compile: bool = True
     compile_capture_parity_gate: bool = True
     graph_safe_mode: bool = True
+    graph_ring_slots: int = 8
+    graph_fixed_bucket_mb: int = 256
 
     # Distributed coordination
     distributed_coordination_enabled: bool = True
@@ -111,6 +131,7 @@ class AIMemoryConfig:
     coordination_timeout_s: float = 1.0
     anti_skew_enabled: bool = True
     reproducibility_mode: bool = False
+    topology_awareness_enabled: bool = True
 
     # Inference KV manager
     kv_manager_enabled: bool = False
@@ -118,6 +139,9 @@ class AIMemoryConfig:
     kv_prefill_prefetch_lookahead: int = 8
     kv_decode_prefetch_lookahead: int = 1
     kv_latency_slo_ms: float = 20.0
+    kv_eviction_policy: str = "LRU"  # LRU | CLOCK
+    kv_tenant_fairness: bool = True
+    kv_tenant_budget_ratio: float = 0.25
 
     # Control-plane / agent
     control_plane_dir: str = ""

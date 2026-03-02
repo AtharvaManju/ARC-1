@@ -2,12 +2,12 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import torch
 
 from .util import dtype_to_str, round_up
-from .io_workers import SpillHostJob
+from .io_workers import SpillHostJob, PrefetchJob
 
 
 @dataclass
@@ -18,6 +18,7 @@ class NativeSubmit:
     shape: Tuple[int, ...]
     nbytes: int
     done_evt: threading.Event
+    logical_chunks: int = 1
 
 
 class NativeRuntime:
@@ -35,6 +36,8 @@ class NativeRuntime:
         self.batch_submit = bool(getattr(cfg, "native_batch_submit", True))
         self.max_batch_ops = max(1, int(getattr(cfg, "native_max_batch_ops", 64)))
         self.flush_interval_s = max(0.0, float(getattr(cfg, "native_flush_interval_ms", 0.25)) / 1000.0)
+        self.chunk_bytes = max(1, int(getattr(cfg, "native_chunk_bytes", 64 * 1024 * 1024)))
+        self.inflight_bytes_limit = max(0, int(getattr(cfg, "native_inflight_bytes_limit", 8 * 1024**3)))
 
         self._q: "queue.Queue[NativeSubmit]" = queue.Queue(maxsize=max(64, self.max_batch_ops * 8))
         self._stop = threading.Event()
@@ -43,6 +46,12 @@ class NativeRuntime:
         self._fatal: Optional[str] = None
         self._ops = 0
         self._batches = 0
+        self._logical_chunks = 0
+        self._state_updates = 0
+        self._inflight_bytes = 0
+        self._inflight_lock = threading.Lock()
+        self._prefetch_plan: List[tuple[str, object]] = []
+        self._prefetch_lock = threading.Lock()
 
         if self.enabled:
             self._t = threading.Thread(target=self._loop, daemon=True)
@@ -62,14 +71,38 @@ class NativeRuntime:
             "enabled": bool(self.enabled),
             "ops": int(self._ops),
             "batches": int(self._batches),
+            "logical_chunks": int(self._logical_chunks),
+            "state_updates": int(self._state_updates),
+            "inflight_bytes": int(self._inflight_bytes),
+            "inflight_limit": int(self.inflight_bytes_limit),
             "fatal": self.fatal(),
             "queue_depth": int(self._q.qsize()),
         }
+
+    def update_prefetch_schedule(self, items: List[tuple[str, object]]):
+        with self._prefetch_lock:
+            self._prefetch_plan = list(items)
+
+    def _drain_prefetch_schedule(self):
+        with self._prefetch_lock:
+            items = list(self._prefetch_plan)
+            self._prefetch_plan.clear()
+        for key, meta in items:
+            try:
+                self.io.reserve_prefetch(key)
+                self.io.submit_prefetch(PrefetchJob(key=key, meta=meta))
+            except Exception:
+                continue
 
     def submit_spill(self, key: str, step_id: int, t: torch.Tensor, done_evt: threading.Event) -> bool:
         if (not self.enabled) or self._stop.is_set():
             return False
         nbytes = int(t.numel() * t.element_size())
+        with self._inflight_lock:
+            if self.inflight_bytes_limit > 0 and (self._inflight_bytes + nbytes) > self.inflight_bytes_limit:
+                self.metrics.inflight_budget_denials += 1
+                return False
+            self._inflight_bytes += nbytes
         try:
             self._q.put_nowait(
                 NativeSubmit(
@@ -79,10 +112,13 @@ class NativeRuntime:
                     shape=tuple(int(x) for x in t.shape),
                     nbytes=nbytes,
                     done_evt=done_evt,
+                    logical_chunks=max(1, int((nbytes + self.chunk_bytes - 1) // self.chunk_bytes)),
                 )
             )
             return True
         except queue.Full:
+            with self._inflight_lock:
+                self._inflight_bytes = max(0, self._inflight_bytes - nbytes)
             return False
 
     def _set_fatal(self, msg: str):
@@ -124,9 +160,14 @@ class NativeRuntime:
                     timeout_s=float(getattr(self.cfg, "queue_put_timeout_s", 0.01)),
                 )
                 self._ops += 1
+                self._logical_chunks += int(sub.logical_chunks)
+                self._state_updates += 1
             except Exception as e:
                 self._set_fatal(f"native runtime spill failed: {type(e).__name__}: {e}")
                 sub.done_evt.set()
+            finally:
+                with self._inflight_lock:
+                    self._inflight_bytes = max(0, self._inflight_bytes - int(sub.nbytes))
 
     def _loop(self):
         batch: list[NativeSubmit] = []
@@ -139,9 +180,11 @@ class NativeRuntime:
                 if (not self.batch_submit) or len(batch) >= self.max_batch_ops:
                     self._flush_batch(batch)
                     batch.clear()
+                    self._drain_prefetch_schedule()
                     last_flush = time.time()
             except queue.Empty:
                 if batch:
                     self._flush_batch(batch)
                     batch.clear()
+                    self._drain_prefetch_schedule()
                     last_flush = time.time()

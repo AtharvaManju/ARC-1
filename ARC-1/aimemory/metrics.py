@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from collections import deque
-from typing import Deque
+from typing import Deque, Dict
 import numpy as np
 
 @dataclass
@@ -75,7 +75,46 @@ class Metrics:
     coord_policy_applied: int = 0
     kv_spills: int = 0
     kv_restores: int = 0
+    throttle_events: int = 0
+    spill_budget_denials: int = 0
+    inflight_budget_denials: int = 0
+    fairness_denials: int = 0
+    quarantine_events: int = 0
+    p999_step_ms: float = 0.0
+
+    # Latency attribution histograms
+    restore_wait_hist: Hist = field(default_factory=Hist)
+    io_read_hist: Hist = field(default_factory=Hist)
+    io_write_hist: Hist = field(default_factory=Hist)
+    cpu_staging_hist: Hist = field(default_factory=Hist)
+    decode_hist: Hist = field(default_factory=Hist)
+    decompress_hist: Hist = field(default_factory=Hist)
+    h2d_copy_hist: Hist = field(default_factory=Hist)
+    stream_sync_hist: Hist = field(default_factory=Hist)
+    kv_token_latency_hist: Hist = field(default_factory=Hist)
 
     def prefetch_hit_rate(self) -> float:
         d = self.prefetch_hits + self.prefetch_misses
         return 100.0 * (self.prefetch_hits / d) if d else 100.0
+
+    def latency_snapshot(self) -> Dict[str, float]:
+        return {
+            "restore_wait_p95_ms": self.restore_wait_hist.pct(95),
+            "restore_wait_p99_ms": self.restore_wait_hist.pct(99),
+            "io_read_p95_ms": self.io_read_hist.pct(95),
+            "io_read_p99_ms": self.io_read_hist.pct(99),
+            "io_write_p95_ms": self.io_write_hist.pct(95),
+            "io_write_p99_ms": self.io_write_hist.pct(99),
+            "cpu_staging_p95_ms": self.cpu_staging_hist.pct(95),
+            "cpu_staging_p99_ms": self.cpu_staging_hist.pct(99),
+            "decode_p95_ms": self.decode_hist.pct(95),
+            "decode_p99_ms": self.decode_hist.pct(99),
+            "decompress_p95_ms": self.decompress_hist.pct(95),
+            "decompress_p99_ms": self.decompress_hist.pct(99),
+            "h2d_copy_p95_ms": self.h2d_copy_hist.pct(95),
+            "h2d_copy_p99_ms": self.h2d_copy_hist.pct(99),
+            "stream_sync_p95_ms": self.stream_sync_hist.pct(95),
+            "stream_sync_p99_ms": self.stream_sync_hist.pct(99),
+            "kv_token_latency_p95_ms": self.kv_token_latency_hist.pct(95),
+            "kv_token_latency_p99_ms": self.kv_token_latency_hist.pct(99),
+        }

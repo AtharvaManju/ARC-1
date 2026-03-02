@@ -37,7 +37,11 @@ def main():
                 raise AssertionError("expected integrity verification failure")
             except RuntimeError as e:
                 msg = str(e).lower()
-                assert ("manifest" in msg) or ("crc32 mismatch" in msg), msg
+                assert (
+                    ("manifest" in msg)
+                    or ("crc32 mismatch" in msg)
+                    or ("payload sha256 mismatch" in msg)
+                ), msg
             finally:
                 st.release_pinned(payload)
 

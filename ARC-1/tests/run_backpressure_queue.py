@@ -2,12 +2,23 @@ import queue
 import threading
 
 from aimemory.io_workers import IOWorkers, SpillHostJob, PrefetchJob
+from aimemory.metrics import Metrics
 
 
 def _dummy_workers():
     w = IOWorkers.__new__(IOWorkers)
     w._q = queue.Queue(maxsize=1)
     w._stop = threading.Event()
+    w.metrics = Metrics()
+    w._soft_queue_limit = 1
+    w._inflight_lock = threading.Lock()
+    w._inflight_spill_limit = 0
+    w._inflight_prefetch_limit = 0
+    w._inflight_spill_bytes = 0
+    w._inflight_prefetch_bytes = 0
+    w._step_bytes_lock = threading.Lock()
+    w._step_bytes = {}
+    w._fairness_per_step_bytes = 0
     return w
 
 

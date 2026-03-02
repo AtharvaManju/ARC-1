@@ -83,6 +83,11 @@ def build_fleet_report(pool_dir: str) -> Dict[str, Any]:
     total_coord_applied = sum(int(r.get("coord_policy_applied", 0)) for r in ranks)
     total_kv_spills = sum(int(r.get("kv_spills", 0)) for r in ranks)
     total_kv_restores = sum(int(r.get("kv_restores", 0)) for r in ranks)
+    total_throttle = sum(int(r.get("throttle_events", 0)) for r in ranks)
+    total_budget_denials = sum(int(r.get("spill_budget_denials", 0)) for r in ranks)
+    total_inflight_denials = sum(int(r.get("inflight_budget_denials", 0)) for r in ranks)
+    total_fairness_denials = sum(int(r.get("fairness_denials", 0)) for r in ranks)
+    total_quarantine = sum(int(r.get("quarantine_events", 0)) for r in ranks)
     p95s = [float(r.get("step_p95_ms", 0.0)) for r in ranks if float(r.get("step_p95_ms", 0.0)) > 0.0]
     p99s = [float(r.get("step_p99_ms", 0.0)) for r in ranks if float(r.get("step_p99_ms", 0.0)) > 0.0]
     spills = [int(r.get("spills", 0)) for r in ranks]
@@ -100,6 +105,11 @@ def build_fleet_report(pool_dir: str) -> Dict[str, Any]:
         "total_coord_policy_applied": total_coord_applied,
         "total_kv_spills": total_kv_spills,
         "total_kv_restores": total_kv_restores,
+        "total_throttle_events": total_throttle,
+        "total_spill_budget_denials": total_budget_denials,
+        "total_inflight_denials": total_inflight_denials,
+        "total_fairness_denials": total_fairness_denials,
+        "total_quarantine_events": total_quarantine,
         "fleet_step_p95_ms_max": (max(p95s) if p95s else 0.0),
         "fleet_step_p99_ms_max": (max(p99s) if p99s else 0.0),
         "rank_skew_pct": rank_skew_pct,

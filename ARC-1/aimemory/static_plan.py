@@ -107,3 +107,21 @@ class StaticPlanCompiler:
 
 def model_fingerprint(name: str, shape_sig: Tuple[int, ...], dtype_s: str) -> str:
     return _hash_obj({"name": str(name), "shape": list(shape_sig), "dtype": str(dtype_s)})
+
+
+def model_fingerprint_full(
+    name: str,
+    shape_sig: Tuple[int, ...],
+    dtype_s: str,
+    world_size: int,
+    graph_key: str = "",
+) -> str:
+    return _hash_obj(
+        {
+            "name": str(name),
+            "shape": list(shape_sig),
+            "dtype": str(dtype_s),
+            "world_size": int(world_size),
+            "graph_key": str(graph_key),
+        }
+    )

@@ -4,6 +4,7 @@ import threading
 import zlib
 import time
 import json
+import hashlib
 from dataclasses import dataclass
 from typing import Tuple, Optional, Dict, List
 
@@ -14,6 +15,7 @@ from .util import ensure_dir, round_up, sha_meta, shape_to_json, shape_from_json
 from .security import load_key, encrypt_into, decrypt_to, ENC_OVERHEAD, audit_log
 from .compression import compress_blob, decompress_blob, normalize_codec
 from .pinned import PinnedBlockPool, PinnedBlock
+from .fault_injection import get_fault_injector
 
 try:
     from aimemory_engine import SARCCore  # type: ignore
@@ -39,6 +41,7 @@ class TensorMeta:
     codec: str = "none"
     restored_count: int = 0
     chunk_manifest_json: str = ""
+    payload_sha256: str = ""
 
 
 STATUS_RESERVED = "RESERVED"
@@ -251,6 +254,7 @@ class SARCStorage:
         self._ram_bytes = 0
 
         self.pinned_pool = pinned_pool
+        self._fault = get_fault_injector()
 
         self._init_db()
         self._migrate_if_needed()
@@ -310,6 +314,7 @@ class SARCStorage:
                 stored_nbytes INTEGER NOT NULL DEFAULT 0,
                 codec TEXT NOT NULL DEFAULT 'none',
                 chunk_manifest TEXT NOT NULL DEFAULT '',
+                payload_sha256 TEXT NOT NULL DEFAULT '',
                 restored_count INTEGER NOT NULL DEFAULT 0,
                 crc32 INTEGER NOT NULL
             )
@@ -327,6 +332,21 @@ class SARCStorage:
                 state TEXT NOT NULL,
                 ts REAL NOT NULL,
                 details TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS quarantine (
+                key TEXT PRIMARY KEY,
+                ts REAL NOT NULL,
+                reason TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ops (
+                op_id TEXT PRIMARY KEY,
+                key TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                ts REAL NOT NULL
             )
         """)
         conn.commit()
@@ -350,6 +370,8 @@ class SARCStorage:
             conn.execute("ALTER TABLE tensors ADD COLUMN codec TEXT NOT NULL DEFAULT 'none'")
         if "chunk_manifest" not in cols:
             conn.execute("ALTER TABLE tensors ADD COLUMN chunk_manifest TEXT NOT NULL DEFAULT ''")
+        if "payload_sha256" not in cols:
+            conn.execute("ALTER TABLE tensors ADD COLUMN payload_sha256 TEXT NOT NULL DEFAULT ''")
         if "restored_count" not in cols:
             conn.execute("ALTER TABLE tensors ADD COLUMN restored_count INTEGER NOT NULL DEFAULT 0")
         conn.execute("""
@@ -361,7 +383,22 @@ class SARCStorage:
                 details TEXT NOT NULL DEFAULT ''
             )
         """)
-        conn.execute("PRAGMA user_version=3;")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS quarantine (
+                key TEXT PRIMARY KEY,
+                ts REAL NOT NULL,
+                reason TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ops (
+                op_id TEXT PRIMARY KEY,
+                key TEXT NOT NULL,
+                phase TEXT NOT NULL,
+                ts REAL NOT NULL
+            )
+        """)
+        conn.execute("PRAGMA user_version=4;")
         conn.commit()
         conn.close()
 
@@ -396,6 +433,11 @@ class SARCStorage:
         conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=%s;" % ("FULL" if self.durable else "NORMAL"))
+        # Drop unfinished ops and any associated uncommitted rows.
+        stale_ops = conn.execute("SELECT op_id,key,phase FROM ops WHERE phase!='DONE'").fetchall()
+        for _, key, _ in stale_ops:
+            conn.execute("DELETE FROM tensors WHERE key=? AND committed=0", (str(key),))
+        conn.execute("DELETE FROM ops WHERE phase!='DONE'")
         conn.execute(
             "DELETE FROM tensors WHERE committed=0 OR status IN (?, ?, ?, ?)",
             (STATUS_RESERVED, STATUS_WRITING, STATUS_FAILED, STATUS_PREFETCHING),
@@ -428,6 +470,13 @@ class SARCStorage:
         conn.execute("DELETE FROM tensors WHERE key=? AND committed=0", (key,))
         conn.commit()
         self._append_manifest_event(key, STATUS_FAILED, "")
+
+    def quarantine_key(self, key: str, reason: str):
+        conn = self._conn()
+        conn.execute("INSERT OR REPLACE INTO quarantine(key, ts, reason) VALUES(?,?,?)", (str(key), float(time.time()), str(reason)))
+        conn.execute("UPDATE tensors SET status=? WHERE key=?", (STATUS_FAILED, str(key)))
+        conn.commit()
+        self._append_manifest_event(str(key), STATUS_FAILED, str(reason))
 
     # --- pooled pinned helpers ---
     def acquire_pinned(self, nbytes: int) -> PinnedBlock:
@@ -494,16 +543,24 @@ class SARCStorage:
         if status_s not in VALID_STATUSES:
             raise ValueError(f"invalid status: {status_s}")
         conn = self._conn()
-        row = conn.execute("SELECT status, committed FROM tensors WHERE key=?", (key,)).fetchone()
-        if row is None:
-            raise KeyError(key)
-        prev_status, committed = str(row[0]), int(row[1])
-        if not is_valid_transition(prev_status, status_s):
-            raise RuntimeError(f"invalid state transition key={key}: {prev_status}->{status_s}")
-        if committed != 1 and status_s in READABLE_STATUSES:
-            raise RuntimeError(f"illegal readable status before commit for key={key}: {status_s}")
-        conn.execute("UPDATE tensors SET status=? WHERE key=?", (status_s, key))
-        conn.commit()
+        conn.execute("BEGIN IMMEDIATE;")
+        try:
+            row = conn.execute("SELECT status, committed FROM tensors WHERE key=?", (key,)).fetchone()
+            if row is None:
+                raise KeyError(key)
+            prev_status, committed = str(row[0]), int(row[1])
+            if not is_valid_transition(prev_status, status_s):
+                raise RuntimeError(f"invalid state transition key={key}: {prev_status}->{status_s}")
+            if committed != 1 and status_s in READABLE_STATUSES:
+                raise RuntimeError(f"illegal readable status before commit for key={key}: {status_s}")
+            conn.execute("UPDATE tensors SET status=? WHERE key=?", (status_s, key))
+            conn.execute("COMMIT;")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK;")
+            except Exception:
+                pass
+            raise
         self._append_manifest_event(key, status_s, "")
 
     def _append_manifest_event(self, key: str, state: str, details: str):
@@ -621,12 +678,22 @@ class SARCStorage:
         replay = self.replay_manifest(repair=repair)
         if not replay.get("ok", True):
             issues.append({"issue": "manifest_replay_mismatch", "count": int(replay.get("count", 0))})
-        return {"ok": len(issues) == 0, "issues": issues, "count": len(issues), "manifest": replay}
+        qrows = conn.execute("SELECT key, ts, reason FROM quarantine ORDER BY ts DESC LIMIT 128").fetchall()
+        quarantine = [{"key": str(k), "ts": float(ts), "reason": str(r)} for (k, ts, r) in qrows]
+        return {
+            "ok": len(issues) == 0,
+            "issues": issues,
+            "count": len(issues),
+            "manifest": replay,
+            "quarantine_count": len(quarantine),
+            "quarantine": quarantine,
+        }
 
     def put_host_bytes(self, key: str, plain_blk: PinnedBlock, nbytes: int,
                        dtype_s: str, shape: Tuple[int, ...], step_id: int,
                        spill_done_evt=None) -> TensorMeta:
         try:
+            op_id = f"{key}:{int(time.time()*1e9)}"
             encrypted = 1 if self.encrypt_at_rest else 0
             pool_id = self._pool_id_for_step(step_id)
 
@@ -640,6 +707,7 @@ class SARCStorage:
             )
             stored_nbytes = len(comp_payload)
             chunk_manifest_json = build_chunk_manifest(comp_payload)
+            payload_sha256 = hashlib.sha256(comp_payload).hexdigest()
 
             payload_bytes = (stored_nbytes + ENC_OVERHEAD) if encrypted else stored_nbytes
             padded_bytes = round_up(payload_bytes)
@@ -647,18 +715,27 @@ class SARCStorage:
             checksum = sha_meta(dtype_s, shape, nbytes, padded_bytes, offset, encrypted, step_id, pool_id)
 
             conn = self._conn()
-            conn.execute("BEGIN;")
+            conn.execute("BEGIN IMMEDIATE;")
             conn.execute(
-                "INSERT OR REPLACE INTO tensors(key, step_id, pool_id, offset, nbytes, padded_bytes, dtype, shape, checksum, committed, status, encrypted, compressed, stored_nbytes, codec, chunk_manifest, restored_count, crc32) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 0, ?)",
+                "INSERT OR REPLACE INTO tensors(key, step_id, pool_id, offset, nbytes, padded_bytes, dtype, shape, checksum, committed, status, encrypted, compressed, stored_nbytes, codec, chunk_manifest, payload_sha256, restored_count, crc32) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
                 (
                     key, int(step_id), int(pool_id), int(offset), int(nbytes), int(padded_bytes),
                     dtype_s, shape_to_json(shape), checksum, STATUS_RESERVED, encrypted,
-                    int(compressed), int(stored_nbytes), codec_used, chunk_manifest_json, int(plain_crc),
+                    int(compressed), int(stored_nbytes), codec_used, chunk_manifest_json, payload_sha256, int(plain_crc),
                 ),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO ops(op_id, key, phase, ts) VALUES(?,?,?,?)",
+                (str(op_id), str(key), "START", float(time.time())),
             )
             conn.execute("COMMIT;")
             self._set_status(key, STATUS_WRITING)
+            self._fault.delay("spill", "delay_spill_ms")
+            if self._fault.should_enospc():
+                raise OSError("fault:ENOSPC")
+            if self._fault.should_eio():
+                raise OSError("fault:EIO")
 
             pool_path = None
             if self.backend == "RAM":
@@ -675,6 +752,7 @@ class SARCStorage:
                         encrypted=encrypted, crc32=plain_crc, status_s=STATUS_EVICTABLE,
                         compressed=int(compressed), stored_nbytes=int(stored_nbytes), codec=codec_used, restored_count=0,
                         chunk_manifest_json=chunk_manifest_json,
+                        payload_sha256=payload_sha256,
                     )
                     with self._ram_lock:
                         self._ram[key] = (enc_blk, meta)
@@ -692,6 +770,7 @@ class SARCStorage:
                         encrypted=encrypted, crc32=plain_crc, status_s=STATUS_EVICTABLE,
                         compressed=int(compressed), stored_nbytes=int(stored_nbytes), codec=codec_used, restored_count=0,
                         chunk_manifest_json=chunk_manifest_json,
+                        payload_sha256=payload_sha256,
                     )
                     with self._ram_lock:
                         self._ram[key] = (ram_blk, meta)
@@ -705,6 +784,11 @@ class SARCStorage:
 
                 src_blk = self._bytes_to_block(comp_payload) if compressed else plain_blk
                 try:
+                    if self._fault.should_torn_write():
+                        # Inject partial payload write to validate crash/corruption handling.
+                        half = max(1, int(padded_bytes // 2))
+                        self._python_write_tensor(pool_path, offset, src_blk.u8, half)
+                        raise RuntimeError("fault:torn_write")
                     if encrypted:
                         assert self._key is not None
                         enc_blk = self.acquire_pinned(padded_bytes)
@@ -752,6 +836,8 @@ class SARCStorage:
             conn.commit()
             self._append_manifest_event(key, STATUS_COMMITTED, f"stored_nbytes={stored_nbytes}")
             self._set_status(key, STATUS_EVICTABLE)
+            conn.execute("UPDATE ops SET phase=?, ts=? WHERE op_id=?", ("DONE", float(time.time()), str(op_id)))
+            conn.commit()
             if self.durable:
                 try:
                     dfd = os.open(os.path.dirname(self.db_path) or ".", os.O_RDONLY)
@@ -782,7 +868,16 @@ class SARCStorage:
                 encrypted=encrypted, crc32=plain_crc, status_s=STATUS_EVICTABLE,
                 compressed=int(compressed), stored_nbytes=int(stored_nbytes), codec=codec_used, restored_count=0,
                 chunk_manifest_json=chunk_manifest_json,
+                payload_sha256=payload_sha256,
             )
+        except Exception as e:
+            try:
+                conn = self._conn()
+                conn.execute("INSERT OR REPLACE INTO ops(op_id, key, phase, ts) VALUES(?,?,?,?)", (str(op_id), str(key), "FAILED", float(time.time())))
+                conn.commit()
+            except Exception:
+                pass
+            raise
         finally:
             if spill_done_evt is not None:
                 spill_done_evt.set()
@@ -795,13 +890,13 @@ class SARCStorage:
 
         conn = self._conn()
         row = conn.execute(
-            "SELECT step_id, pool_id, offset, nbytes, padded_bytes, dtype, shape, checksum, committed, status, encrypted, compressed, stored_nbytes, codec, chunk_manifest, restored_count, crc32 "
+            "SELECT step_id, pool_id, offset, nbytes, padded_bytes, dtype, shape, checksum, committed, status, encrypted, compressed, stored_nbytes, codec, chunk_manifest, payload_sha256, restored_count, crc32 "
             "FROM tensors WHERE key=?",
             (key,),
         ).fetchone()
         if not row:
             raise KeyError(key)
-        step_id, pool_id, offset, nbytes, padded_bytes, dtype_s, shape_s, checksum, committed, status_s, encrypted, compressed, stored_nbytes, codec, chunk_manifest_json, restored_count, crc32v = row
+        step_id, pool_id, offset, nbytes, padded_bytes, dtype_s, shape_s, checksum, committed, status_s, encrypted, compressed, stored_nbytes, codec, chunk_manifest_json, payload_sha256, restored_count, crc32v = row
         if int(committed) != 1:
             raise KeyError(f"{key} not committed")
         if str(status_s) not in READABLE_STATUSES:
@@ -818,13 +913,19 @@ class SARCStorage:
             dtype_s=dtype_s, shape=shape, sha256=checksum, encrypted=int(encrypted), crc32=int(crc32v),
             status_s=str(status_s), compressed=int(compressed), stored_nbytes=int(stored_nbytes), codec=str(codec), restored_count=int(restored_count),
             chunk_manifest_json=str(chunk_manifest_json or ""),
+            payload_sha256=str(payload_sha256 or ""),
         )
 
     def read_block_to_pinned(self, meta: TensorMeta, dst_blk: PinnedBlock):
+        self._fault.delay("read", "delay_read_ms")
+        if self._fault.should_eio():
+            raise OSError("fault:EIO")
         if self.backend == "RAM":
             with self._ram_lock:
                 blk, _ = self._ram[meta.key]
                 dst_blk.u8[:meta.padded_bytes].copy_(blk.u8[:meta.padded_bytes], non_blocking=False)
+            if self._fault.should_corrupt_read() and meta.padded_bytes > 0:
+                dst_blk.u8[0] = int(dst_blk.u8[0].item() ^ 0x01)
             return
 
         pool_path = self._pool_path(meta.pool_id)
@@ -833,6 +934,8 @@ class SARCStorage:
                 self.engine._native.read_file_to_host_ptr(pool_path, dst_blk.u8.data_ptr(), meta.padded_bytes, meta.offset, self.strict_direct)
             else:
                 self._python_read_into_tensor(pool_path, meta.offset, dst_blk.u8, meta.padded_bytes)
+        if self._fault.should_corrupt_read() and meta.padded_bytes > 0:
+            dst_blk.u8[0] = int(dst_blk.u8[0].item() ^ 0x01)
 
     def decode_to_plain_block(
         self,
@@ -858,7 +961,19 @@ class SARCStorage:
             src_u8 = payload_blk.u8[:(meta.stored_nbytes or meta.nbytes)]
 
         stored_blob = self._u8_to_bytes(src_u8, meta.stored_nbytes or meta.nbytes)
+        if str(meta.payload_sha256 or ""):
+            got_sha = hashlib.sha256(stored_blob).hexdigest()
+            if got_sha != str(meta.payload_sha256):
+                try:
+                    self.quarantine_key(meta.key, "payload_sha256_mismatch")
+                except Exception:
+                    pass
+                raise RuntimeError("payload sha256 mismatch: data corruption detected")
         if not verify_chunk_manifest(stored_blob, meta.chunk_manifest_json):
+            try:
+                self.quarantine_key(meta.key, "chunk_manifest_mismatch")
+            except Exception:
+                pass
             raise RuntimeError("chunk manifest verification failed")
 
         if int(meta.compressed):
@@ -877,6 +992,10 @@ class SARCStorage:
 
         got = crc32_u8(plain_blk.u8, meta.nbytes)
         if got != meta.crc32:
+            try:
+                self.quarantine_key(meta.key, "crc32_mismatch")
+            except Exception:
+                pass
             raise RuntimeError("CRC32 mismatch: data corruption detected")
         return plain_blk, scratch_work, owns_plain, owns_work
 

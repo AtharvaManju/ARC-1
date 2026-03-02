@@ -23,9 +23,11 @@ from .autotune import RuntimeAutoTuner
 from .control_plane import PolicyStore
 from .governor import MemoryGovernor
 from .native_runtime import NativeRuntime
-from .static_plan import StaticPlanCompiler, model_fingerprint
+from .static_plan import StaticPlanCompiler, model_fingerprint_full
 from .distributed_coord import RankCoordinator
 from .kv_manager import KVResidencyManager
+from .perf_envelope import PerformanceEnvelope
+from .topology import detect_topology
 
 @dataclass
 class PackedRef:
@@ -118,6 +120,12 @@ class AIMemoryController:
                 pinned_pool_bytes=cfg.pinned_pool_bytes,
                 stream_priority=cfg.prefetch_stream_priority,
                 enforce_ordering=bool(getattr(cfg, "deterministic_io_ordering", True)),
+                inflight_spill_bytes_limit=int(getattr(cfg, "inflight_spill_bytes_limit", 0)),
+                inflight_prefetch_bytes_limit=int(getattr(cfg, "inflight_prefetch_bytes_limit", 0)),
+                fairness_per_step_bytes=int(getattr(cfg, "fairness_per_step_bytes", 0)),
+                nvme_write_bw_limit_mb_s=float(getattr(cfg, "nvme_write_bw_limit_mb_s", 0.0)),
+                nvme_read_bw_limit_mb_s=float(getattr(cfg, "nvme_read_bw_limit_mb_s", 0.0)),
+                queue_soft_limit=max(1, int(float(getattr(cfg, "queue_soft_limit_ratio", 0.85)) * max(1, int(cfg.max_queue)))),
             )
             self.kv = KVResidencyManager(cfg, self.storage)
 
@@ -137,6 +145,7 @@ class AIMemoryController:
         self._agent_metrics_path = os.path.join(cfg.pool_dir, f"rank_{self.rank}", "agent_metrics.json")
         self._autotuner = RuntimeAutoTuner(cfg, self.metrics)
         self._governor = MemoryGovernor(cfg, self.metrics)
+        self._envelope = PerformanceEnvelope(cfg, self.metrics)
         self._native_runtime = None
         if (not self._noop) and bool(getattr(cfg, "native_performance_mode", False)):
             self._native_runtime = NativeRuntime(cfg=cfg, storage=self.storage, io=self.io, metrics=self.metrics)
@@ -155,6 +164,7 @@ class AIMemoryController:
                 self._static_plan_lookup = {int(e.pack_idx): int(e.prefetch_lookahead) for e in self._static_plan.entries}
 
         self._rank_coord = None
+        self._topology = detect_topology(rank=self.rank)
         coord_dir = str(getattr(cfg, "coordination_dir", "") or os.path.join(cfg.pool_dir, "coordination"))
         if bool(getattr(cfg, "distributed_coordination_enabled", True)) and int(self.world_size) > 1:
             self._rank_coord = RankCoordinator(
@@ -200,10 +210,12 @@ class AIMemoryController:
         if bool(getattr(self.cfg, "static_plan_mode", False)) and bool(getattr(self.cfg, "static_plan_auto_compile", True)):
             sched = (self.pcc.schedule.restore_pack_order if self.pcc.schedule is not None else [])
             if sched:
-                mfp = model_fingerprint(
+                mfp = model_fingerprint_full(
                     name=str(getattr(self.cfg, "model_profile_name", "") or "default"),
                     shape_sig=(len(sched),),
                     dtype_s="autograd",
+                    world_size=int(self.world_size),
+                    graph_key=str(getattr(self.cfg, "static_plan_key", "") or ""),
                 )
                 plan = self._plan_compiler.compile_from_restore_order(
                     model_fingerprint=mfp,
@@ -250,6 +262,7 @@ class AIMemoryController:
             "queue_depth": (self.io.queue_depth() if self.io else 0),
             "step_p95_ms": m.step_hist.pct(95),
             "step_p99_ms": m.step_hist.pct(99),
+            "step_p999_ms": m.step_hist.pct(99.9),
             "spill_min_bytes": int(self.cfg.spill_min_bytes),
             "pcc_lookahead": int(self.cfg.pcc_lookahead),
             "governor_level": int(m.governor_level),
@@ -262,11 +275,22 @@ class AIMemoryController:
             "coord_policy_applied": int(m.coord_policy_applied),
             "kv_spills": int(m.kv_spills),
             "kv_restores": int(m.kv_restores),
+            "throttle_events": int(m.throttle_events),
+            "spill_budget_denials": int(m.spill_budget_denials),
+            "inflight_budget_denials": int(m.inflight_budget_denials),
+            "fairness_denials": int(m.fairness_denials),
+            "quarantine_events": int(m.quarantine_events),
             "native_runtime": (self._native_runtime.stats() if self._native_runtime is not None else {"enabled": False}),
             "static_plan_mode": bool(getattr(self.cfg, "static_plan_mode", False)),
             "static_plan_key": str(self._static_plan.plan_key) if self._static_plan is not None else "",
             "distributed_coordination": bool(self._rank_coord is not None),
+            "reproducibility_mode": bool(getattr(self.cfg, "reproducibility_mode", False)),
+            "collective_safe_mode": bool(getattr(self.cfg, "collective_safe_mode", True)),
+            "topology": dict(self._topology),
             "kv_manager": (self.kv.stats() if getattr(self, "kv", None) is not None else {"enabled": False}),
+            "latency_attribution": m.latency_snapshot(),
+            "performance_envelope": self._envelope.snapshot(),
+            "backpressure": (self.io.backpressure_state() if self.io is not None else {}),
             "engine_native": bool((self.storage is not None) and (self.storage.engine._native is not None)),
             "engine_gds": bool((self.storage is not None) and self.storage.engine.gds_enabled()),
             "engine_uring": bool((self.storage is not None) and self.storage.engine.uring_enabled()),
@@ -336,6 +360,10 @@ class AIMemoryController:
         if int(getattr(self.metrics, "governor_level", 0)) >= 2:
             return
         lim = max(1, int(getattr(self.cfg, "prefetch_batch_limit", 8)))
+        if bool(getattr(self.cfg, "collective_safe_mode", True)):
+            cad = max(1, int(getattr(self.cfg, "collective_cadence_steps", 1)))
+            if (self._step_id % cad) == 0:
+                lim = 1
         if self.io is not None:
             qd = int(self.io.queue_depth())
             q_cap = max(1, int(getattr(self.cfg, "max_queue", 1)))
@@ -356,6 +384,10 @@ class AIMemoryController:
 
         nbytes = int(t.numel() * t.element_size())
         if (not self.metrics.spilling_enabled) or self.metrics.safe_mode or (nbytes < int(self.cfg.spill_min_bytes)):
+            return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
+        ok_budget, why = self._envelope.can_spill(nbytes=nbytes, rank=self.rank)
+        if not ok_budget:
+            self.metrics.disable_reason = f"spill_denied:{why}"
             return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
         if self.io is not None:
             fatal = self.io.fatal_error()
@@ -386,6 +418,7 @@ class AIMemoryController:
             self._spill_done_events[key] = done_evt
             submitted = self._native_runtime.submit_spill(key=key, step_id=self._step_id, t=t, done_evt=done_evt)
             if submitted:
+                self._envelope.note_spill(nbytes=nbytes, rank=self.rank)
                 self.metrics.spills += 1
                 self.metrics.spill_bytes += nbytes
                 return PackedRef(kind="SPILLED", pack_idx=pack_idx, key=key, dtype_s=dtype_s, shape=shape, nbytes=nbytes)
@@ -492,6 +525,7 @@ class AIMemoryController:
 
         self.metrics.spills += 1
         self.metrics.spill_bytes += nbytes
+        self._envelope.note_spill(nbytes=nbytes, rank=self.rank)
         return PackedRef(kind="SPILLED", pack_idx=pack_idx, key=key, dtype_s=dtype_s, shape=shape, nbytes=nbytes)
 
     def _unpack_hook(self, ref: PackedRef) -> torch.Tensor:
@@ -523,6 +557,7 @@ class AIMemoryController:
             done_evt.wait()
             dt_ms = (time.time() - t0) * 1000.0
             self.metrics.spill_commit_wait_ms_ema.update(dt_ms)
+            self.metrics.restore_wait_hist.add(dt_ms)
 
         out = None
         try:
@@ -560,23 +595,34 @@ class AIMemoryController:
                         self.storage.mark_prefetching(key)
                     except Exception:
                         pass
+                    t0_io = time.time()
                     self.storage.read_block_to_pinned(meta, enc_blk)
+                    self.metrics.io_read_hist.add((time.time() - t0_io) * 1000.0)
 
+                    t0_decode = time.time()
                     plain_blk, work_blk, owns_plain, owns_work = self.storage.decode_to_plain_block(
                         meta, enc_blk, scratch_plain=None, scratch_work=None
                     )
+                    dt_decode = (time.time() - t0_decode) * 1000.0
+                    self.metrics.decode_hist.add(dt_decode)
+                    if int(getattr(meta, "compressed", 0)) == 1:
+                        self.metrics.decompress_hist.add(dt_decode)
 
                     out = torch.empty(meta.shape, device="cuda", dtype=str_to_dtype(meta.dtype_s))
                     src_u8 = plain_blk.u8[:meta.nbytes].view(torch.uint8).reshape(-1)
                     out_u8 = out.view(torch.uint8).reshape(-1)
+                    t0_h2d = time.time()
                     if self._restore_stream is not None:
                         evt = torch.cuda.Event(enable_timing=False, blocking=False)
                         with torch.cuda.stream(self._restore_stream):
                             out_u8.copy_(src_u8, non_blocking=True)
                             evt.record(self._restore_stream)
+                        t0_sync = time.time()
                         torch.cuda.current_stream().wait_event(evt)
+                        self.metrics.stream_sync_hist.add((time.time() - t0_sync) * 1000.0)
                     else:
                         out_u8.copy_(src_u8, non_blocking=True)
+                    self.metrics.h2d_copy_hist.add((time.time() - t0_h2d) * 1000.0)
                     try:
                         self.storage.mark_resident(key)
                     except Exception:
@@ -594,6 +640,8 @@ class AIMemoryController:
         except Exception as e:
             if "out of memory" in str(e).lower():
                 self._governor.on_oom_signal(self._step_id)
+            if ("mismatch" in str(e).lower()) or ("corruption" in str(e).lower()):
+                self.metrics.quarantine_events += 1
             self.metrics.spilling_enabled = False
             self.metrics.safe_mode = True
             self.metrics.disable_reason = f"Restore failed: {type(e).__name__}: {e}"
@@ -634,6 +682,7 @@ class AIMemoryController:
             c._spill_order_evt = None
 
             c.pcc.reset_step()
+            c._envelope.start_step(c._step_id)
 
             if not c._noop:
                 # CUDA event timing (no global synchronize)
@@ -685,10 +734,11 @@ class AIMemoryController:
                 c.policy.maybe_reenable(c._step_id)
                 c._autotuner.observe_step(c._step_id)
                 c._governor.observe_step(c._step_id)
+                c._envelope.end_step(io=c.io)
                 c.pcc.lookahead = int(c.cfg.pcc_lookahead)
                 if c._rank_coord is not None and (c._step_id % max(1, int(getattr(c.cfg, "coordination_interval_steps", 5))) == 0):
                     try:
-                        c._rank_coord.publish(c._step_id, c.metrics_snapshot())
+                        c._rank_coord.publish(c._step_id, c.metrics_snapshot(), topology=(c._topology if bool(getattr(c.cfg, "topology_awareness_enabled", True)) else {}))
                         if c.rank == int(getattr(c.cfg, "coordination_leader_rank", 0)):
                             c._rank_coord.leader_aggregate(c._step_id)
                         consensus = c._rank_coord.poll_consensus(max_age_s=float(getattr(c.cfg, "coordination_timeout_s", 1.0)))
@@ -697,6 +747,7 @@ class AIMemoryController:
                                 c.cfg,
                                 consensus,
                                 anti_skew=bool(getattr(c.cfg, "anti_skew_enabled", True)),
+                                rank=c.rank,
                             )
                             if applied:
                                 c.metrics.coord_policy_applied += 1
@@ -726,6 +777,11 @@ class AIMemoryController:
                         "memory_headroom_pct": c.metrics.memory_headroom_pct,
                         "step_p95_ms": c.metrics.step_hist.pct(95),
                         "step_p99_ms": c.metrics.step_hist.pct(99),
+                        "step_p999_ms": c.metrics.step_hist.pct(99.9),
+                        "restore_wait_p99_ms": c.metrics.restore_wait_hist.pct(99),
+                        "io_write_p99_ms": c.metrics.io_write_hist.pct(99),
+                        "io_read_p99_ms": c.metrics.io_read_hist.pct(99),
+                        "decode_p99_ms": c.metrics.decode_hist.pct(99),
                         "backend": c.backend,
                         "rank": c.rank,
                     },

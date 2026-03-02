@@ -201,6 +201,8 @@ def run_qualification(
         "baseline_step_ms_avg": baseline_ms,
         "aimemory_step_ms_avg": step_ms,
         "overhead_pct": overhead_pct,
+        "aimemory_step_p95_ms": float(bench.get("step_ms_p95", 0.0)),
+        "aimemory_step_p99_ms": float(bench.get("step_ms_p99", 0.0)),
         "convergence_delta_ratio": conv_delta,
         "criteria": {
             "threshold_multiplier": float(threshold_multiplier),
@@ -218,6 +220,9 @@ def run_qualification(
             "safe_mode": bool(bench.get("metrics", {}).get("safe_mode", False)),
             "disable_reason": str(bench.get("metrics", {}).get("disable_reason", "")),
             "prefetch_hit_rate": float(bench.get("metrics", {}).get("prefetch_hit_rate", 0.0)),
+            "latency_attribution": bench.get("metrics", {}).get("latency_attribution", {}),
+            "backpressure": bench.get("metrics", {}).get("backpressure", {}),
+            "performance_envelope": bench.get("metrics", {}).get("performance_envelope", {}),
         },
         "compile_capture_parity": parity,
         "native_runtime": bench.get("metrics", {}).get("native_runtime", {"enabled": False}),
