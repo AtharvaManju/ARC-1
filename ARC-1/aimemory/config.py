@@ -3,12 +3,14 @@ from dataclasses import dataclass
 @dataclass
 class AIMemoryConfig:
     pool_dir: str = "/mnt/nvme_pool"
-    backend: str = "AUTO"  # AUTO | NVME_FILE | RAM | NOOP
+    backend: str = "AUTO"  # AUTO | NVME_FILE | RAM | TMPFS | NETWORK_FILE | NOOP
     durable: bool = False
     staging_mb: int = 512
     strict_direct: bool = False
     compile_safe_mode: bool = True
     strict_local_pool: bool = True
+    tenant_namespace: str = "default"
+    tenant_id: str = "default"
 
     spill_min_bytes: int = 128 * 1024 * 1024
     io_workers: int = 2
@@ -68,8 +70,10 @@ class AIMemoryConfig:
 
     # Disk budget + GC
     max_pool_bytes: int = 500 * 1024**3
+    disk_quota_bytes: int = 500 * 1024**3
     gc_keep_last_windows: int = 2
     pool_window_steps: int = 50
+    retention_keep_days: int = 14
 
     # NEW: deterministic retention cadence + DB maintenance
     gc_every_steps: int = 50                 # run retention cleanup every N steps (default: each window)
@@ -78,6 +82,11 @@ class AIMemoryConfig:
 
     # RAM backend budget
     ram_max_bytes: int = 64 * 1024**3
+    allow_tmpfs_backend: bool = True
+    allow_network_backend: bool = False
+    backend_probe_mb: int = 128
+    backend_probe_seconds: float = 2.0
+    backend_auto_disable_on_slow_fs: bool = True
 
     # NEW: perf killer toggle (default OFF)
     sync_each_step: bool = False             # if True, do torch.cuda.synchronize() each step end (debug/bench)
@@ -97,6 +106,8 @@ class AIMemoryConfig:
     fail_open_on_error: bool = True
     unpack_meta_wait_timeout_s: float = 2.0
     unpack_meta_wait_poll_s: float = 0.002
+    allocator_friendly_mode: bool = True
+    allocator_fragmentation_warn_pct: float = 35.0
 
     # Determinism / stream semantics
     deterministic_stream_fences: bool = True
@@ -147,5 +158,17 @@ class AIMemoryConfig:
     control_plane_dir: str = ""
     policy_name: str = ""
     policy_canary_ratio: float = 1.0
+    policy_stage: str = "stable"
+    policy_require_signature: bool = False
+    policy_signing_key_uri: str = ""
+    policy_auto_rollback_enabled: bool = True
+    policy_rollback_p99_ms: float = 0.0
+    policy_rollback_safe_mode_max: int = 0
     agent_bind: str = "127.0.0.1"
     agent_port: int = 9765
+    agent_heartbeat_interval_s: float = 5.0
+
+    # ROI / workload identity
+    workload_id: str = ""
+    workload_identity_file: str = ""
+    roi_dir: str = ""

@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 import torch
+from .allocator import allocator_snapshot
 
 
 @dataclass
@@ -45,8 +46,12 @@ class MemoryGovernor:
         return int(free_b), int(total_b)
 
     def _pick_level(self, headroom_pct: float) -> int:
+        alloc = allocator_snapshot()
+        frag = float(alloc.get("fragmentation_pct", 0.0))
         if headroom_pct <= self.emergency_pct:
             return 2
+        if frag >= float(getattr(self.cfg, "allocator_fragmentation_warn_pct", 35.0)):
+            return max(1, int(self._level))
         if headroom_pct <= self.warn_pct:
             return 1
         return 0

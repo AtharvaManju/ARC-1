@@ -5,6 +5,7 @@ import zlib
 import time
 import json
 import hashlib
+import glob
 from dataclasses import dataclass
 from typing import Tuple, Optional, Dict, List
 
@@ -16,6 +17,7 @@ from .security import load_key, encrypt_into, decrypt_to, ENC_OVERHEAD, audit_lo
 from .compression import compress_blob, decompress_blob, normalize_codec
 from .pinned import PinnedBlockPool, PinnedBlock
 from .fault_injection import get_fault_injector
+from .version import DB_SCHEMA_VERSION, MIN_COMPAT_DB_SCHEMA_VERSION, MANIFEST_SCHEMA_VERSION
 
 try:
     from aimemory_engine import SARCCore  # type: ignore
@@ -214,8 +216,15 @@ class SARCStorage:
         pinned_pool: Optional[PinnedBlockPool] = None,
         pool_window_steps: int = 50,
         ram_max_bytes: int = 64 * 1024**3,
+        tenant_namespace: str = "default",
+        disk_quota_bytes: int = 0,
     ):
-        self.rank_dir = os.path.join(pool_dir, f"rank_{rank}")
+        ns = str(tenant_namespace or "default").strip().replace("/", "_").replace("..", "_")
+        if ns and ns not in ("default", "shared"):
+            self.rank_dir = os.path.join(pool_dir, f"ns_{ns}", f"rank_{rank}")
+        else:
+            self.rank_dir = os.path.join(pool_dir, f"rank_{rank}")
+        self.tenant_namespace = ns
         ensure_dir(self.rank_dir)
 
         self.db_path = os.path.join(self.rank_dir, "metadata.db")
@@ -226,6 +235,7 @@ class SARCStorage:
 
         self.pool_window_steps = max(1, int(pool_window_steps))
         self.ram_max_bytes = int(ram_max_bytes)
+        self.disk_quota_bytes = int(max(0, disk_quota_bytes))
 
         self.encrypt_at_rest = bool(encrypt_at_rest)
         self._key: Optional[bytes] = None
@@ -349,11 +359,20 @@ class SARCStorage:
                 ts REAL NOT NULL
             )
         """)
+        conn.execute("INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)", ("manifest_schema_version", str(int(MANIFEST_SCHEMA_VERSION))))
+        conn.execute(f"PRAGMA user_version={int(DB_SCHEMA_VERSION)};")
         conn.commit()
         conn.close()
 
     def _migrate_if_needed(self):
         conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
+        uv = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
+        if uv > int(DB_SCHEMA_VERSION):
+            conn.close()
+            raise RuntimeError(
+                f"metadata db schema {uv} is newer than supported {DB_SCHEMA_VERSION}; "
+                "upgrade AIMemory runtime for forward-compatibility"
+            )
         cols = [r[1] for r in conn.execute("PRAGMA table_info(tensors)").fetchall()]
         if "step_id" not in cols:
             conn.execute("ALTER TABLE tensors ADD COLUMN step_id INTEGER NOT NULL DEFAULT 0")
@@ -398,7 +417,8 @@ class SARCStorage:
                 ts REAL NOT NULL
             )
         """)
-        conn.execute("PRAGMA user_version=4;")
+        conn.execute("INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)", ("manifest_schema_version", str(int(MANIFEST_SCHEMA_VERSION))))
+        conn.execute(f"PRAGMA user_version={int(DB_SCHEMA_VERSION)};")
         conn.commit()
         conn.close()
 
@@ -428,6 +448,32 @@ class SARCStorage:
             nxt = off + need
             self._store_next_offset(pool_id, nxt)
             return off
+
+    def _total_pool_bytes(self) -> int:
+        if self.backend == "RAM":
+            with self._ram_lock:
+                return int(self._ram_bytes)
+        total = 0
+        for p in glob.glob(os.path.join(self.rank_dir, "pool_*.bin")):
+            try:
+                total += int(os.path.getsize(p))
+            except Exception:
+                pass
+        return int(total)
+
+    def compatibility_report(self) -> dict:
+        conn = self._conn()
+        uv = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
+        row = conn.execute("SELECT v FROM meta WHERE k='manifest_schema_version'").fetchone()
+        mv = int(row[0]) if row else 0
+        return {
+            "db_schema_version": int(uv),
+            "supported_db_schema_version": int(DB_SCHEMA_VERSION),
+            "min_compat_db_schema_version": int(MIN_COMPAT_DB_SCHEMA_VERSION),
+            "manifest_schema_version": int(mv),
+            "supported_manifest_schema_version": int(MANIFEST_SCHEMA_VERSION),
+            "ok": bool((MIN_COMPAT_DB_SCHEMA_VERSION <= uv <= DB_SCHEMA_VERSION) and (mv <= MANIFEST_SCHEMA_VERSION)),
+        }
 
     def recover(self):
         conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
@@ -687,6 +733,7 @@ class SARCStorage:
             "manifest": replay,
             "quarantine_count": len(quarantine),
             "quarantine": quarantine,
+            "compatibility": self.compatibility_report(),
         }
 
     def put_host_bytes(self, key: str, plain_blk: PinnedBlock, nbytes: int,
@@ -711,6 +758,12 @@ class SARCStorage:
 
             payload_bytes = (stored_nbytes + ENC_OVERHEAD) if encrypted else stored_nbytes
             padded_bytes = round_up(payload_bytes)
+            if self.disk_quota_bytes > 0:
+                projected = int(self._total_pool_bytes()) + int(padded_bytes)
+                if projected > int(self.disk_quota_bytes):
+                    raise OSError(
+                        f"ENOSPC: disk quota exceeded projected={projected} quota={self.disk_quota_bytes}"
+                    )
             offset = self.alloc(pool_id, padded_bytes) if self.backend == "NVME_FILE" else 0
             checksum = sha_meta(dtype_s, shape, nbytes, padded_bytes, offset, encrypted, step_id, pool_id)
 
@@ -877,6 +930,11 @@ class SARCStorage:
                 conn.commit()
             except Exception:
                 pass
+            if self.enable_audit_log:
+                try:
+                    audit_log(self.audit_log_path, "spill_failed", key=key, err=str(e), backend=self.backend)
+                except Exception:
+                    pass
             raise
         finally:
             if spill_done_evt is not None:

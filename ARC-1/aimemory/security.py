@@ -2,6 +2,7 @@ import os
 import json
 import time
 import base64
+import hashlib
 import numpy as np
 import torch
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
@@ -56,6 +57,31 @@ def resolve_key_from_uri(uri: str) -> bytes:
             raise ValueError("raw file key must be 32 bytes")
         return k
 
+    if u.startswith("kms://"):
+        # KMS/HSM abstraction layer (pluggable by URI convention):
+        #   kms://env/VARNAME
+        #   kms://file/abs/path
+        body = u[len("kms://"):]
+        if body.startswith("env/"):
+            name = body[len("env/"):].strip()
+            val = os.environ.get(name, "").strip()
+            if not val:
+                raise ValueError(f"kms env key not found: {name}")
+            try:
+                k = bytes.fromhex(val)
+            except Exception:
+                k = base64.b64decode(val)
+            if len(k) != 32:
+                raise ValueError("kms env key must decode to 32 bytes")
+            return k
+        if body.startswith("file/"):
+            p = "/" + body[len("file/"):].lstrip("/")
+            k = _read_key_bytes(p)
+            if len(k) != 32:
+                raise ValueError("kms file key must be 32 bytes")
+            return k
+        raise ValueError(f"unsupported kms uri format: {uri}")
+
     raise ValueError(f"unsupported key uri: {uri}")
 
 def load_or_create_key(key_path: str) -> bytes:
@@ -92,6 +118,7 @@ def rotate_key(key_path: str, new_key_path: str = "") -> bytes:
     with open(p, "wb") as f:
         f.write(k)
     os.chmod(p, 0o600)
+    audit_log(os.path.join(os.path.dirname(p) or ".", "aimemory.audit.jsonl"), "key_rotated", key_path=p)
     return k
 
 def _as_contig_u8_view(t_u8: torch.Tensor, nbytes: int) -> memoryview:
@@ -171,6 +198,40 @@ def secure_wipe(path: str, passes: int = 1, verify: bool = False):
     if verify:
         with open(path, "rb") as f:
             sample = f.read(min(4096, sz))
-        if sample == (b"\x00" * len(sample)):
-            raise RuntimeError("secure wipe verification failed")
+        if not sample:
+            raise RuntimeError("secure wipe verification failed: empty sample")
+        if len(set(sample)) <= 1:
+            raise RuntimeError("secure wipe verification failed: low entropy sample")
+        digest = hashlib.sha256(sample).hexdigest()
+        if digest == hashlib.sha256(b"\x00" * len(sample)).hexdigest():
+            raise RuntimeError("secure wipe verification failed: zeroed sample")
     os.remove(path)
+
+
+def enforce_retention(path: str, keep_days: int, wipe: bool = False, wipe_passes: int = 1) -> dict:
+    now = time.time()
+    keep_s = max(0, int(keep_days)) * 86400
+    removed = []
+    scanned = 0
+    base = os.path.abspath(path or ".")
+    if not os.path.exists(base):
+        return {"ok": True, "scanned": 0, "removed": 0, "files": []}
+    for root, _, files in os.walk(base):
+        for fn in files:
+            fp = os.path.join(root, fn)
+            scanned += 1
+            try:
+                mt = os.path.getmtime(fp)
+            except Exception:
+                continue
+            if keep_s > 0 and (now - mt) <= keep_s:
+                continue
+            try:
+                if wipe:
+                    secure_wipe(fp, passes=wipe_passes, verify=True)
+                else:
+                    os.remove(fp)
+                removed.append(fp)
+            except Exception:
+                continue
+    return {"ok": True, "scanned": int(scanned), "removed": int(len(removed)), "files": removed[:128]}

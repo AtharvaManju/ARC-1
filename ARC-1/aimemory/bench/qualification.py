@@ -195,7 +195,38 @@ def run_qualification(
     )
     comp.shutdown()
 
+    gate_correctness = bool(pass_conv and bool(parity.get("ok", False)))
+    gate_crash_safety = bool(not bool(bench.get("metrics", {}).get("safe_mode", False)))
+    gate_integrity = int(bench.get("metrics", {}).get("quarantine_events", 0)) == 0
+    gate_overhead_p95 = float(bench.get("step_ms_p95", 0.0)) > 0.0 and (overhead_pct <= float(overhead_sla_pct))
+    gate_overhead_p99 = bool(pass_tail)
+    gate_rank_skew = True  # single-rank synthetic qualification; multi-rank gate should come from fleet report
+    gate_compile = bool(parity.get("ok", False))
+    kv_lat = bench.get("metrics", {}).get("latency_attribution", {}).get("kv_token_latency_p99_ms", 0.0)
+    kv_enabled = bool(bench.get("metrics", {}).get("kv_manager", {}).get("enabled", False))
+    gate_infer_lat = (not kv_enabled) or (float(kv_lat) <= max(10.0, float(overhead_sla_pct)))
+
+    gates = {
+        "correctness": {"pass": bool(gate_correctness), "value": float(conv_delta), "threshold": 0.05},
+        "crash_safety": {"pass": bool(gate_crash_safety), "safe_mode": bool(bench.get("metrics", {}).get("safe_mode", False))},
+        "integrity": {"pass": bool(gate_integrity), "quarantine_events": int(bench.get("metrics", {}).get("quarantine_events", 0))},
+        "p95_overhead": {"pass": bool(gate_overhead_p95), "value": float(overhead_pct), "threshold": float(overhead_sla_pct)},
+        "p99_overhead": {"pass": bool(gate_overhead_p99), "value": float(p99_overhead), "threshold": max(float(overhead_sla_pct) * 1.5, float(overhead_sla_pct) + 5.0)},
+        "rank_skew": {"pass": bool(gate_rank_skew), "value": 0.0, "threshold": 20.0},
+        "compile_parity": {"pass": bool(gate_compile)},
+        "inference_latency": {"pass": bool(gate_infer_lat), "enabled": bool(kv_enabled), "kv_token_p99_ms": float(kv_lat)},
+    }
+    all_pass = all(bool(v.get("pass", False)) for v in gates.values())
+    hard_fail = (not gate_integrity) or (not gate_crash_safety) or (not gate_correctness)
+    if all_pass:
+        rollout = "PASS"
+    elif hard_fail:
+        rollout = "BLOCK"
+    else:
+        rollout = "CANARY_ONLY"
+
     report = {
+        "qualification_spec_version": "arc1.qual.v1",
         "headroom_gate": gate,
         "bench": bench,
         "baseline_step_ms_avg": baseline_ms,
@@ -225,11 +256,14 @@ def run_qualification(
             "performance_envelope": bench.get("metrics", {}).get("performance_envelope", {}),
         },
         "compile_capture_parity": parity,
+        "gates": gates,
+        "rollout_decision": rollout,
+        "rollout_reasons": [k for k, v in gates.items() if not bool(v.get("pass", False))],
         "native_runtime": bench.get("metrics", {}).get("native_runtime", {"enabled": False}),
         "distributed_coordination": bench.get("metrics", {}).get("distributed_coordination", False),
         "kv_manager": bench.get("metrics", {}).get("kv_manager", {"enabled": False}),
         "rank_skew_pct": 0.0,
-        "passed": bool(pass_headroom and pass_overhead and pass_conv and pass_tail and bool(parity.get("ok", False))),
+        "passed": bool(all_pass and pass_headroom and pass_overhead),
         "elapsed_s": time.time() - t0,
     }
     with open(out_path, "w") as f:

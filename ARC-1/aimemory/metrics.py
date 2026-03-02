@@ -71,6 +71,11 @@ class Metrics:
     memory_free_bytes: int = 0
     memory_total_bytes: int = 0
     memory_headroom_pct: float = 0.0
+    allocator_allocated_bytes: int = 0
+    allocator_reserved_bytes: int = 0
+    allocator_inactive_split_bytes: int = 0
+    allocator_reclaimable_bytes: int = 0
+    allocator_fragmentation_pct: float = 0.0
     static_plan_hits: int = 0
     coord_policy_applied: int = 0
     kv_spills: int = 0
@@ -81,6 +86,7 @@ class Metrics:
     fairness_denials: int = 0
     quarantine_events: int = 0
     p999_step_ms: float = 0.0
+    policy_version: int = 0
 
     # Latency attribution histograms
     restore_wait_hist: Hist = field(default_factory=Hist)

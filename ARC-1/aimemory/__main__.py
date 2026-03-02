@@ -13,6 +13,10 @@ from aimemory.agent import run_agent
 from aimemory.static_plan import StaticPlanCompiler, model_fingerprint_full
 from aimemory.distributed_coord import RankCoordinator
 from aimemory.topology import detect_topology
+from aimemory.backend import detect_backend_capabilities, benchmark_path, recommend_io_tuning
+from aimemory.roi import ROITracker, WorkloadIdentity
+from aimemory.security import enforce_retention
+from aimemory.storage import SARCStorage
 
 def main():
     p = argparse.ArgumentParser(prog="aimemory")
@@ -57,6 +61,7 @@ def main():
     s = sub.add_parser("support-bundle")
     s.add_argument("--pool-dir", default="/mnt/nvme_pool")
     s.add_argument("--rank", type=int, default=0)
+    s.add_argument("--namespace", default="default")
     s.add_argument("--out", default="./aimemory_support_bundle.zip")
 
     cc = sub.add_parser("consistency-check")
@@ -70,14 +75,26 @@ def main():
     pp.add_argument("--name", required=True)
     pp.add_argument("--file", required=True)
     pp.add_argument("--reason", default="manual")
+    pp.add_argument("--stage", default="stable")
+    pp.add_argument("--canary-ratio", type=float, default=1.0)
+    pp.add_argument("--key-uri", default="")
 
     ps = sub.add_parser("policy-show")
     ps.add_argument("--pool-dir", default="/mnt/nvme_pool")
     ps.add_argument("--name", required=True)
+    ps.add_argument("--require-signature", action="store_true")
+    ps.add_argument("--key-uri", default="")
+    ps.add_argument("--envelope", action="store_true")
 
     pr = sub.add_parser("policy-rollback")
     pr.add_argument("--pool-dir", default="/mnt/nvme_pool")
     pr.add_argument("--name", required=True)
+
+    pav = sub.add_parser("policy-auto-rollback")
+    pav.add_argument("--pool-dir", default="/mnt/nvme_pool")
+    pav.add_argument("--name", required=True)
+    pav.add_argument("--p99-ms-max", type=float, default=0.0)
+    pav.add_argument("--safe-mode-max", type=int, default=0)
 
     fr = sub.add_parser("fleet-report")
     fr.add_argument("--pool-dir", default="/mnt/nvme_pool")
@@ -87,6 +104,43 @@ def main():
     ag.add_argument("--bind", default="127.0.0.1")
     ag.add_argument("--port", type=int, default=9765)
     ag.add_argument("--metrics-path", default="")
+    ag.add_argument("--heartbeat-path", default="")
+    ag.add_argument("--heartbeat-interval-s", type=float, default=5.0)
+
+    bc = sub.add_parser("backend-capabilities")
+    bc.add_argument("--pool-dir", default="/mnt/nvme_pool")
+    bc.add_argument("--probe-mb", type=int, default=128)
+    bc.add_argument("--probe-seconds", type=float, default=2.0)
+
+    rb = sub.add_parser("roi-baseline")
+    rb.add_argument("--pool-dir", default="/mnt/nvme_pool")
+    rb.add_argument("--model", default="default")
+    rb.add_argument("--batch-size", type=int, default=0)
+    rb.add_argument("--seq-len", type=int, default=0)
+    rb.add_argument("--precision", default="autograd")
+    rb.add_argument("--world-size", type=int, default=1)
+    rb.add_argument("--job", default="")
+    rb.add_argument("--metrics-file", required=True)
+
+    rr = sub.add_parser("roi-report")
+    rr.add_argument("--pool-dir", default="/mnt/nvme_pool")
+    rr.add_argument("--model", default="default")
+    rr.add_argument("--batch-size", type=int, default=0)
+    rr.add_argument("--seq-len", type=int, default=0)
+    rr.add_argument("--precision", default="autograd")
+    rr.add_argument("--world-size", type=int, default=1)
+    rr.add_argument("--job", default="")
+    rr.add_argument("--metrics-file", required=True)
+
+    rc = sub.add_parser("retention-clean")
+    rc.add_argument("--path", required=True)
+    rc.add_argument("--keep-days", type=int, default=14)
+    rc.add_argument("--wipe", action="store_true")
+    rc.add_argument("--wipe-passes", type=int, default=1)
+
+    sc = sub.add_parser("schema-compat")
+    sc.add_argument("--pool-dir", default="/mnt/nvme_pool")
+    sc.add_argument("--rank", type=int, default=0)
 
     spc = sub.add_parser("static-plan-compile")
     spc.add_argument("--pool-dir", default="/mnt/nvme_pool")
@@ -150,7 +204,7 @@ def main():
         print(r)
         return 0
     if args.cmd == "support-bundle":
-        out = build_support_bundle(args.pool_dir, args.out, rank=args.rank)
+        out = build_support_bundle(args.pool_dir, args.out, rank=args.rank, namespace=args.namespace)
         print("Wrote", out)
         return 0
     if args.cmd == "consistency-check":
@@ -161,18 +215,43 @@ def main():
         store = PolicyStore(root_dir=f"{args.pool_dir}/control_plane")
         with open(args.file, "r") as f:
             pol = json.load(f)
-        p = store.push(args.name, pol, reason=args.reason)
+        p = store.push(
+            args.name,
+            pol,
+            reason=args.reason,
+            stage=args.stage,
+            canary_ratio=float(args.canary_ratio),
+            key_uri=str(args.key_uri),
+        )
         print("Wrote", p)
         return 0
     if args.cmd == "policy-show":
         store = PolicyStore(root_dir=f"{args.pool_dir}/control_plane")
-        pol = store.pull(args.name)
+        if args.envelope:
+            pol = store.pull_envelope(args.name)
+        else:
+            pol = store.pull(
+                args.name,
+                require_signature=bool(args.require_signature),
+                key_uri=str(args.key_uri),
+            )
         print(json.dumps(pol or {}, indent=2))
         return 0
     if args.cmd == "policy-rollback":
         store = PolicyStore(root_dir=f"{args.pool_dir}/control_plane")
         pol = store.rollback(args.name)
         print(json.dumps(pol or {}, indent=2))
+        return 0
+    if args.cmd == "policy-auto-rollback":
+        store = PolicyStore(root_dir=f"{args.pool_dir}/control_plane")
+        fleet = build_fleet_report(args.pool_dir)
+        pol = store.auto_rollback_on_slo(
+            args.name,
+            fleet,
+            p99_ms_max=float(args.p99_ms_max),
+            safe_mode_max=int(args.safe_mode_max),
+        )
+        print(json.dumps({"rolled_back": bool(pol is not None), "policy": pol or {}, "fleet": fleet}, indent=2))
         return 0
     if args.cmd == "fleet-report":
         rep = build_fleet_report(args.pool_dir)
@@ -182,7 +261,61 @@ def main():
         print(json.dumps(rep, indent=2))
         return 0
     if args.cmd == "agent":
-        run_agent(bind=args.bind, port=args.port, metrics_path=args.metrics_path)
+        run_agent(
+            bind=args.bind,
+            port=args.port,
+            metrics_path=args.metrics_path,
+            heartbeat_path=args.heartbeat_path,
+            heartbeat_interval_s=float(args.heartbeat_interval_s),
+        )
+        return 0
+    if args.cmd == "backend-capabilities":
+        caps = detect_backend_capabilities(args.pool_dir)
+        probe = benchmark_path(args.pool_dir, probe_mb=int(args.probe_mb), probe_seconds=float(args.probe_seconds))
+        tune = recommend_io_tuning(caps, probe)
+        print(json.dumps({"capabilities": caps, "probe": probe, "recommended": tune}, indent=2))
+        return 0
+    if args.cmd == "roi-baseline":
+        with open(args.metrics_file, "r") as f:
+            m = json.load(f)
+        wid = WorkloadIdentity(
+            model=str(args.model),
+            batch_size=int(args.batch_size),
+            seq_len=int(args.seq_len),
+            precision=str(args.precision),
+            world_size=int(args.world_size),
+            job=str(args.job),
+        )
+        tr = ROITracker(f"{args.pool_dir}/roi")
+        p = tr.capture_baseline(wid, m)
+        print(json.dumps({"baseline_path": p}, indent=2))
+        return 0
+    if args.cmd == "roi-report":
+        with open(args.metrics_file, "r") as f:
+            m = json.load(f)
+        wid = WorkloadIdentity(
+            model=str(args.model),
+            batch_size=int(args.batch_size),
+            seq_len=int(args.seq_len),
+            precision=str(args.precision),
+            world_size=int(args.world_size),
+            job=str(args.job),
+        )
+        tr = ROITracker(f"{args.pool_dir}/roi")
+        rep = tr.attribution(wid, m)
+        print(json.dumps(rep, indent=2))
+        return 0
+    if args.cmd == "retention-clean":
+        rep = enforce_retention(args.path, keep_days=int(args.keep_days), wipe=bool(args.wipe), wipe_passes=int(args.wipe_passes))
+        print(json.dumps(rep, indent=2))
+        return 0
+    if args.cmd == "schema-compat":
+        st = SARCStorage(pool_dir=args.pool_dir, rank=int(args.rank), backend="NVME_FILE", durable=False, encrypt_at_rest=False)
+        try:
+            rep = st.compatibility_report()
+        finally:
+            st.close()
+        print(json.dumps(rep, indent=2))
         return 0
     if args.cmd == "static-plan-compile":
         root = f"{args.pool_dir}/static_plans"

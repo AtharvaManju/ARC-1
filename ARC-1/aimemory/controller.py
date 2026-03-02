@@ -16,11 +16,18 @@ from .io_workers import IOWorkers, SpillHostJob, PrefetchJob
 from .util import dtype_to_str, str_to_dtype, round_up
 from .license import verify_license
 from .telemetry import emit_telemetry
-from .backend import detect_distributed, choose_backend, path_is_likely_remote
+from .backend import (
+    detect_distributed,
+    choose_backend,
+    path_is_likely_remote,
+    detect_backend_capabilities,
+    benchmark_path,
+    recommend_io_tuning,
+)
 from .logging_jsonl import JsonlLogger, default_rank_log_path, safe_exc
 from .gc import gc_windows_if_needed
 from .autotune import RuntimeAutoTuner
-from .control_plane import PolicyStore
+from .control_plane import PolicyStore, build_fleet_report
 from .governor import MemoryGovernor
 from .native_runtime import NativeRuntime
 from .static_plan import StaticPlanCompiler, model_fingerprint_full
@@ -28,6 +35,8 @@ from .distributed_coord import RankCoordinator
 from .kv_manager import KVResidencyManager
 from .perf_envelope import PerformanceEnvelope
 from .topology import detect_topology
+from .allocator import allocator_snapshot
+from .roi import ROITracker, WorkloadIdentity
 
 @dataclass
 class PackedRef:
@@ -54,11 +63,18 @@ class AIMemoryController:
 
         cp_dir = str(getattr(cfg, "control_plane_dir", "") or os.path.join(cfg.pool_dir, "control_plane"))
         self._policy_store = PolicyStore(cp_dir)
-        if str(getattr(cfg, "policy_name", "")):
+        self._policy_name = str(getattr(cfg, "policy_name", ""))
+        if self._policy_name:
             ratio = max(0.0, min(float(getattr(cfg, "policy_canary_ratio", 1.0)), 1.0))
             apply_pol = (ratio >= 1.0) or ((self.rank % 1000) < int(ratio * 1000))
             if apply_pol:
-                pol = self._policy_store.pull(str(cfg.policy_name))
+                pol = self._policy_store.select_for_rank(
+                    name=self._policy_name,
+                    rank=self.rank,
+                    require_signature=bool(getattr(cfg, "policy_require_signature", False)),
+                    key_uri=str(getattr(cfg, "policy_signing_key_uri", "")),
+                    stage=str(getattr(cfg, "policy_stage", "")),
+                )
                 if pol:
                     self._policy_store.apply_to_config(cfg, pol)
 
@@ -76,9 +92,32 @@ class AIMemoryController:
         self.policy = AdaptivePolicy(self.metrics, cfg.overhead_sla_pct, cfg.safe_mode_cooldown_steps)
         self.pcc = DeterministicPCC(cfg.pcc_lookahead, cfg.pcc_drift_disable_threshold)
 
-        self.backend = choose_backend(cfg.backend, cfg.pool_dir)
+        self.backend = choose_backend(
+            cfg.backend,
+            cfg.pool_dir,
+            allow_tmpfs=bool(getattr(cfg, "allow_tmpfs_backend", True)),
+            allow_network=bool(getattr(cfg, "allow_network_backend", False)),
+            strict_local_pool=bool(getattr(cfg, "strict_local_pool", True)),
+        )
+        self._backend_caps = detect_backend_capabilities(cfg.pool_dir)
+        self._backend_probe = benchmark_path(
+            cfg.pool_dir,
+            probe_mb=int(getattr(cfg, "backend_probe_mb", 128)),
+            probe_seconds=float(getattr(cfg, "backend_probe_seconds", 2.0)),
+        ) if self.backend in ("NVME_FILE", "TMPFS", "NETWORK_FILE") else {"ok": True}
+        if bool(getattr(cfg, "backend_auto_disable_on_slow_fs", True)) and self.backend == "NETWORK_FILE":
+            self.backend = "RAM"
+        tune = recommend_io_tuning(self._backend_caps, self._backend_probe)
+        if int(getattr(cfg, "max_queue", 0)) > int(tune.get("max_queue", cfg.max_queue)):
+            cfg.max_queue = int(tune.get("max_queue", cfg.max_queue))
+        if int(getattr(cfg, "io_workers", 0)) > int(tune.get("io_workers", cfg.io_workers)):
+            cfg.io_workers = int(tune.get("io_workers", cfg.io_workers))
+        cfg.native_chunk_bytes = int(tune.get("native_chunk_bytes", int(getattr(cfg, "native_chunk_bytes", 64 * 1024 * 1024))))
         self.metrics.backend = self.backend
         self._noop = (self.backend == "NOOP") or (not torch.cuda.is_available())
+        env = self._policy_store.pull_envelope(self._policy_name) if self._policy_name else None
+        if env is not None:
+            self.metrics.policy_version = int(env.get("version", 0))
 
         self._logger = None
         if cfg.enable_jsonl_logs:
@@ -111,6 +150,8 @@ class AIMemoryController:
                 pinned_pool=None,
                 pool_window_steps=cfg.pool_window_steps,
                 ram_max_bytes=cfg.ram_max_bytes,
+                tenant_namespace=str(getattr(cfg, "tenant_namespace", "default")),
+                disk_quota_bytes=int(getattr(cfg, "disk_quota_bytes", cfg.max_pool_bytes)),
             )
             self.io = IOWorkers(
                 storage=self.storage,
@@ -142,7 +183,20 @@ class AIMemoryController:
         self._step_start_evt: Optional[torch.cuda.Event] = None
         self._step_end_evt: Optional[torch.cuda.Event] = None
         self._step_spills_start: int = 0
-        self._agent_metrics_path = os.path.join(cfg.pool_dir, f"rank_{self.rank}", "agent_metrics.json")
+        ns = str(getattr(cfg, "tenant_namespace", "default")).strip().replace("/", "_").replace("..", "_")
+        if ns and ns not in ("default", "shared"):
+            self._agent_metrics_path = os.path.join(cfg.pool_dir, f"ns_{ns}", f"rank_{self.rank}", "agent_metrics.json")
+        else:
+            self._agent_metrics_path = os.path.join(cfg.pool_dir, f"rank_{self.rank}", "agent_metrics.json")
+        self._roi = ROITracker(str(getattr(cfg, "roi_dir", "") or os.path.join(cfg.pool_dir, "roi")))
+        self._wid = WorkloadIdentity(
+            model=str(getattr(cfg, "model_profile_name", "") or "default"),
+            batch_size=0,
+            seq_len=0,
+            precision="autograd",
+            world_size=int(self.world_size),
+            job=str(getattr(cfg, "workload_id", "") or ""),
+        )
         self._autotuner = RuntimeAutoTuner(cfg, self.metrics)
         self._governor = MemoryGovernor(cfg, self.metrics)
         self._envelope = PerformanceEnvelope(cfg, self.metrics)
@@ -271,6 +325,11 @@ class AIMemoryController:
             "memory_headroom_pct": float(m.memory_headroom_pct),
             "memory_free_bytes": int(m.memory_free_bytes),
             "memory_total_bytes": int(m.memory_total_bytes),
+            "allocator_allocated_bytes": int(m.allocator_allocated_bytes),
+            "allocator_reserved_bytes": int(m.allocator_reserved_bytes),
+            "allocator_inactive_split_bytes": int(m.allocator_inactive_split_bytes),
+            "allocator_reclaimable_bytes": int(m.allocator_reclaimable_bytes),
+            "allocator_fragmentation_pct": float(m.allocator_fragmentation_pct),
             "static_plan_hits": int(m.static_plan_hits),
             "coord_policy_applied": int(m.coord_policy_applied),
             "kv_spills": int(m.kv_spills),
@@ -280,6 +339,7 @@ class AIMemoryController:
             "inflight_budget_denials": int(m.inflight_budget_denials),
             "fairness_denials": int(m.fairness_denials),
             "quarantine_events": int(m.quarantine_events),
+            "policy_version": int(m.policy_version),
             "native_runtime": (self._native_runtime.stats() if self._native_runtime is not None else {"enabled": False}),
             "static_plan_mode": bool(getattr(self.cfg, "static_plan_mode", False)),
             "static_plan_key": str(self._static_plan.plan_key) if self._static_plan is not None else "",
@@ -294,6 +354,18 @@ class AIMemoryController:
             "engine_native": bool((self.storage is not None) and (self.storage.engine._native is not None)),
             "engine_gds": bool((self.storage is not None) and self.storage.engine.gds_enabled()),
             "engine_uring": bool((self.storage is not None) and self.storage.engine.uring_enabled()),
+            "backend_capabilities": dict(self._backend_caps),
+            "backend_probe": dict(self._backend_probe),
+            "roi": self._roi.attribution(
+                self._wid,
+                {
+                    "memory_headroom_pct": float(m.memory_headroom_pct),
+                    "oom_events": int(m.oom_degrade_count),
+                    "reruns": int(1 if m.safe_mode else 0),
+                    "throughput": float(1000.0 / max(1e-6, m.step_ms_ema.value)) if m.step_ms_ema.value > 0 else 0.0,
+                    "step_samples_ms": list(m.step_hist.xs),
+                },
+            ),
         }
 
     def compile_capture_parity_gate(self, baseline: Dict[str, float], candidate: Dict[str, float], tol_ratio: float = 0.05) -> Dict[str, Any]:
@@ -734,6 +806,17 @@ class AIMemoryController:
                 c.policy.maybe_reenable(c._step_id)
                 c._autotuner.observe_step(c._step_id)
                 c._governor.observe_step(c._step_id)
+                alloc = allocator_snapshot()
+                c.metrics.allocator_allocated_bytes = int(alloc.get("allocated_bytes", 0))
+                c.metrics.allocator_reserved_bytes = int(alloc.get("reserved_bytes", 0))
+                c.metrics.allocator_inactive_split_bytes = int(alloc.get("inactive_split_bytes", 0))
+                c.metrics.allocator_reclaimable_bytes = int(alloc.get("reclaimable_bytes", 0))
+                c.metrics.allocator_fragmentation_pct = float(alloc.get("fragmentation_pct", 0.0))
+                if bool(getattr(c.cfg, "allocator_friendly_mode", True)):
+                    frag_warn = float(getattr(c.cfg, "allocator_fragmentation_warn_pct", 35.0))
+                    if c.metrics.allocator_fragmentation_pct >= frag_warn:
+                        c.cfg.pcc_lookahead = max(1, int(c.cfg.pcc_lookahead) - 1)
+                        c.cfg.spill_min_bytes = max(1 * 1024 * 1024, int(c.cfg.spill_min_bytes * 0.9))
                 c._envelope.end_step(io=c.io)
                 c.pcc.lookahead = int(c.cfg.pcc_lookahead)
                 if c._rank_coord is not None and (c._step_id % max(1, int(getattr(c.cfg, "coordination_interval_steps", 5))) == 0):
@@ -782,6 +865,8 @@ class AIMemoryController:
                         "io_write_p99_ms": c.metrics.io_write_hist.pct(99),
                         "io_read_p99_ms": c.metrics.io_read_hist.pct(99),
                         "decode_p99_ms": c.metrics.decode_hist.pct(99),
+                        "allocator_fragmentation_pct": c.metrics.allocator_fragmentation_pct,
+                        "policy_version": c.metrics.policy_version,
                         "backend": c.backend,
                         "rank": c.rank,
                     },
@@ -794,10 +879,31 @@ class AIMemoryController:
                     c._logger.log({"evt": "step_end", "step": c._step_id, "dt_ms": dt_ms, "backend": c.backend})
                 try:
                     os.makedirs(os.path.dirname(c._agent_metrics_path) or ".", exist_ok=True)
+                    snap = c.metrics_snapshot()
+                    snap["ts"] = float(time.time())
                     with open(c._agent_metrics_path, "w") as f:
-                        json.dump(c.metrics_snapshot(), f, indent=2)
+                        json.dump(snap, f, indent=2)
                 except Exception:
                     pass
+                if (
+                    c.rank == 0
+                    and bool(getattr(c.cfg, "policy_auto_rollback_enabled", True))
+                    and bool(c._policy_name)
+                    and (c._step_id % max(5, int(getattr(c.cfg, "coordination_interval_steps", 5))) == 0)
+                ):
+                    try:
+                        fleet = build_fleet_report(c.cfg.pool_dir)
+                        rolled = c._policy_store.auto_rollback_on_slo(
+                            c._policy_name,
+                            fleet,
+                            p99_ms_max=float(getattr(c.cfg, "policy_rollback_p99_ms", 0.0)),
+                            safe_mode_max=int(getattr(c.cfg, "policy_rollback_safe_mode_max", 0)),
+                        )
+                        if rolled is not None and c._logger:
+                            c._logger.log({"evt": "policy_auto_rollback", "name": c._policy_name})
+                    except Exception as e:
+                        if c._logger:
+                            c._logger.log({"evt": "policy_auto_rollback_warn", "err": safe_exc(e)})
 
                 # Deterministic retention GC (periodic + emergency budget)
                 try:

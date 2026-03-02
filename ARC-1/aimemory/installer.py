@@ -3,7 +3,7 @@ import time
 import json
 import psutil
 import subprocess
-from .backend import choose_backend
+from .backend import choose_backend, detect_backend_capabilities, benchmark_path, recommend_io_tuning
 
 def _run(cmd):
     return subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode()
@@ -27,7 +27,10 @@ def throughput_test(pool_dir="/mnt/nvme_pool", size_gb=1):
     return gbps
 
 def run_installer(pool_dir="/mnt/nvme_pool", out_path="./aimemory_install_report.json", apply_fixes=False):
+    caps = detect_backend_capabilities(pool_dir)
     backend = choose_backend("AUTO", pool_dir)
+    probe = benchmark_path(pool_dir, probe_mb=128, probe_seconds=2.0) if backend in ("NVME_FILE", "TMPFS", "NETWORK_FILE") else {"ok": True}
+    tune = recommend_io_tuning(caps, probe)
     nvme = throughput_test(pool_dir) if backend == "NVME_FILE" else 0.0
     mem_gb = psutil.virtual_memory().total / 1e9
 
@@ -42,9 +45,18 @@ def run_installer(pool_dir="/mnt/nvme_pool", out_path="./aimemory_install_report
     else:
         rec.update({"spill_min_bytes": 10**18, "io_workers": 0})
 
+    rec.update({
+        "max_queue": int(tune.get("max_queue", 256)),
+        "io_workers": int(tune.get("io_workers", rec.get("io_workers", 1))),
+        "native_chunk_bytes": int(tune.get("native_chunk_bytes", 16 * 1024 * 1024)),
+    })
+
     report = {
         "pool_dir": pool_dir,
         "chosen_backend": backend,
+        "capabilities": caps,
+        "probe": probe,
+        "startup_tuning": tune,
         "nvme_write_gbps": nvme,
         "system_ram_gb": mem_gb,
         "recommended": rec,
