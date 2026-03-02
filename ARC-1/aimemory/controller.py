@@ -22,6 +22,10 @@ from .gc import gc_windows_if_needed
 from .autotune import RuntimeAutoTuner
 from .control_plane import PolicyStore
 from .governor import MemoryGovernor
+from .native_runtime import NativeRuntime
+from .static_plan import StaticPlanCompiler, model_fingerprint
+from .distributed_coord import RankCoordinator
+from .kv_manager import KVResidencyManager
 
 @dataclass
 class PackedRef:
@@ -61,6 +65,10 @@ class AIMemoryController:
             if not st.ok:
                 raise RuntimeError(f"License check failed: {st.reason}")
 
+        if bool(getattr(cfg, "reproducibility_mode", False)):
+            cfg.deterministic_io_ordering = True
+            cfg.deterministic_stream_fences = True
+
         self.metrics = Metrics()
         self.metrics.baseline_step_ms_ema.alpha = float(cfg.baseline_ema_alpha)
         self.policy = AdaptivePolicy(self.metrics, cfg.overhead_sla_pct, cfg.safe_mode_cooldown_steps)
@@ -81,6 +89,7 @@ class AIMemoryController:
         if self._noop:
             self.storage = None
             self.io = None
+            self.kv = None
         else:
             self.storage = SARCStorage(
                 pool_dir=cfg.pool_dir,
@@ -110,6 +119,7 @@ class AIMemoryController:
                 stream_priority=cfg.prefetch_stream_priority,
                 enforce_ordering=bool(getattr(cfg, "deterministic_io_ordering", True)),
             )
+            self.kv = KVResidencyManager(cfg, self.storage)
 
         self._step_id = 0
         self._in_step = False
@@ -127,6 +137,32 @@ class AIMemoryController:
         self._agent_metrics_path = os.path.join(cfg.pool_dir, f"rank_{self.rank}", "agent_metrics.json")
         self._autotuner = RuntimeAutoTuner(cfg, self.metrics)
         self._governor = MemoryGovernor(cfg, self.metrics)
+        self._native_runtime = None
+        if (not self._noop) and bool(getattr(cfg, "native_performance_mode", False)):
+            self._native_runtime = NativeRuntime(cfg=cfg, storage=self.storage, io=self.io, metrics=self.metrics)
+
+        self._plan_compiler = StaticPlanCompiler(
+            str(getattr(cfg, "static_plan_dir", "") or os.path.join(cfg.pool_dir, "static_plans"))
+        )
+        self._static_plan = None
+        self._static_plan_entries: list[int] = []
+        self._static_plan_lookup: dict[int, int] = {}
+        self._static_plan_key = str(getattr(cfg, "static_plan_key", ""))
+        if bool(getattr(cfg, "static_plan_mode", False)) and self._static_plan_key:
+            self._static_plan = self._plan_compiler.load(self._static_plan_key)
+            if self._static_plan is not None:
+                self._static_plan_entries = [int(e.pack_idx) for e in self._static_plan.entries]
+                self._static_plan_lookup = {int(e.pack_idx): int(e.prefetch_lookahead) for e in self._static_plan.entries}
+
+        self._rank_coord = None
+        coord_dir = str(getattr(cfg, "coordination_dir", "") or os.path.join(cfg.pool_dir, "coordination"))
+        if bool(getattr(cfg, "distributed_coordination_enabled", True)) and int(self.world_size) > 1:
+            self._rank_coord = RankCoordinator(
+                root_dir=coord_dir,
+                rank=self.rank,
+                world_size=self.world_size,
+                leader_rank=int(getattr(cfg, "coordination_leader_rank", 0)),
+            )
         self._spill_stream: Optional[torch.cuda.Stream] = None
         self._restore_stream: Optional[torch.cuda.Stream] = None
         self._spill_order_evt: Optional[torch.cuda.Event] = None
@@ -138,6 +174,11 @@ class AIMemoryController:
             self._logger.log({"evt": "init", "rank": self.rank, "world": self.world_size, "backend": self.backend})
 
     def shutdown(self):
+        try:
+            if self._native_runtime is not None:
+                self._native_runtime.close()
+        except Exception:
+            pass
         if self._noop:
             return
         try:
@@ -156,6 +197,24 @@ class AIMemoryController:
             return
         self.pcc.finalize_profile()
         self.metrics.pcc_enabled = self.pcc.enabled
+        if bool(getattr(self.cfg, "static_plan_mode", False)) and bool(getattr(self.cfg, "static_plan_auto_compile", True)):
+            sched = (self.pcc.schedule.restore_pack_order if self.pcc.schedule is not None else [])
+            if sched:
+                mfp = model_fingerprint(
+                    name=str(getattr(self.cfg, "model_profile_name", "") or "default"),
+                    shape_sig=(len(sched),),
+                    dtype_s="autograd",
+                )
+                plan = self._plan_compiler.compile_from_restore_order(
+                    model_fingerprint=mfp,
+                    restore_order=[int(x) for x in sched],
+                    lookahead=int(self.cfg.pcc_lookahead),
+                )
+                self._plan_compiler.save(plan)
+                self._static_plan = plan
+                self._static_plan_key = str(plan.plan_key)
+                self._static_plan_entries = [int(e.pack_idx) for e in plan.entries]
+                self._static_plan_lookup = {int(e.pack_idx): int(e.prefetch_lookahead) for e in plan.entries}
 
     def quick_summary(self) -> str:
         m = self.metrics
@@ -199,10 +258,35 @@ class AIMemoryController:
             "memory_headroom_pct": float(m.memory_headroom_pct),
             "memory_free_bytes": int(m.memory_free_bytes),
             "memory_total_bytes": int(m.memory_total_bytes),
+            "static_plan_hits": int(m.static_plan_hits),
+            "coord_policy_applied": int(m.coord_policy_applied),
+            "kv_spills": int(m.kv_spills),
+            "kv_restores": int(m.kv_restores),
+            "native_runtime": (self._native_runtime.stats() if self._native_runtime is not None else {"enabled": False}),
+            "static_plan_mode": bool(getattr(self.cfg, "static_plan_mode", False)),
+            "static_plan_key": str(self._static_plan.plan_key) if self._static_plan is not None else "",
+            "distributed_coordination": bool(self._rank_coord is not None),
+            "kv_manager": (self.kv.stats() if getattr(self, "kv", None) is not None else {"enabled": False}),
             "engine_native": bool((self.storage is not None) and (self.storage.engine._native is not None)),
             "engine_gds": bool((self.storage is not None) and self.storage.engine.gds_enabled()),
             "engine_uring": bool((self.storage is not None) and self.storage.engine.uring_enabled()),
         }
+
+    def compile_capture_parity_gate(self, baseline: Dict[str, float], candidate: Dict[str, float], tol_ratio: float = 0.05) -> Dict[str, Any]:
+        return self._plan_compiler.compile_capture_parity(baseline=baseline, candidate=candidate, tol_ratio=tol_ratio)
+
+    def kv_register(self, key: str, tensor: torch.Tensor):
+        if getattr(self, "kv", None) is not None:
+            self.kv.register(key, tensor)
+
+    def kv_get(self, key: str) -> Optional[torch.Tensor]:
+        if getattr(self, "kv", None) is not None:
+            return self.kv.get(key)
+        return None
+
+    def kv_release(self, key: str):
+        if getattr(self, "kv", None) is not None:
+            self.kv.release(key)
 
     def _is_compiling(self) -> bool:
         try:
@@ -241,6 +325,12 @@ class AIMemoryController:
             self.metrics.prefetch_dropped += 1
 
     def _submit_lookahead_prefetch(self):
+        if bool(getattr(self.cfg, "static_plan_mode", False)) and self._static_plan is not None:
+            lim = max(1, int(getattr(self.cfg, "prefetch_batch_limit", 8)))
+            for pidx in self._static_plan_entries[:lim]:
+                self._maybe_submit_prefetch_for_pack(int(pidx))
+                self.metrics.static_plan_hits += 1
+            return
         if not self.pcc.enabled or self.pcc.mode != "EXECUTION":
             return
         if int(getattr(self.metrics, "governor_level", 0)) >= 2:
@@ -274,6 +364,13 @@ class AIMemoryController:
                 self.metrics.safe_mode = True
                 self.metrics.disable_reason = f"Fail-open after IO error: {fatal}"
                 return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
+        if self._native_runtime is not None:
+            nf = self._native_runtime.fatal()
+            if nf is not None and bool(getattr(self.cfg, "fail_open_on_error", True)):
+                self.metrics.spilling_enabled = False
+                self.metrics.safe_mode = True
+                self.metrics.disable_reason = f"Fail-open after native runtime error: {nf}"
+                return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
 
         if not t.is_contiguous():
             t = t.contiguous()
@@ -283,6 +380,15 @@ class AIMemoryController:
 
         dtype_s = dtype_to_str(t.dtype)
         shape = tuple(int(x) for x in t.shape)
+
+        if self._native_runtime is not None and bool(getattr(self.cfg, "native_performance_mode", False)):
+            done_evt = self.io.spill_done_event(key)
+            self._spill_done_events[key] = done_evt
+            submitted = self._native_runtime.submit_spill(key=key, step_id=self._step_id, t=t, done_evt=done_evt)
+            if submitted:
+                self.metrics.spills += 1
+                self.metrics.spill_bytes += nbytes
+                return PackedRef(kind="SPILLED", pack_idx=pack_idx, key=key, dtype_s=dtype_s, shape=shape, nbytes=nbytes)
 
         padded_plain = int(round_up(nbytes, 4096))
 
@@ -400,6 +506,12 @@ class AIMemoryController:
             self.metrics.spilling_enabled = False
             self.metrics.safe_mode = True
             self.metrics.disable_reason = f"Fail-open after IO error: {fatal}"
+        if self._native_runtime is not None:
+            nf = self._native_runtime.fatal()
+            if nf is not None and bool(getattr(self.cfg, "fail_open_on_error", True)):
+                self.metrics.spilling_enabled = False
+                self.metrics.safe_mode = True
+                self.metrics.disable_reason = f"Fail-open after native runtime error: {nf}"
 
         if self._profiling:
             self.pcc.record_restore(ref.pack_idx)
@@ -532,6 +644,11 @@ class AIMemoryController:
             if c._noop:
                 return self
 
+            if bool(getattr(c.cfg, "native_disable_python_callbacks", False)):
+                # Explicit bypass mode for environments that run a native/autograph integration.
+                c.metrics.disable_reason = "python_callbacks_bypassed"
+                return self
+
             c._hooks_ctx = torch.autograd.graph.saved_tensors_hooks(c._pack_hook, c._unpack_hook)
             c._hooks_ctx.__enter__()
             return self
@@ -569,6 +686,30 @@ class AIMemoryController:
                 c._autotuner.observe_step(c._step_id)
                 c._governor.observe_step(c._step_id)
                 c.pcc.lookahead = int(c.cfg.pcc_lookahead)
+                if c._rank_coord is not None and (c._step_id % max(1, int(getattr(c.cfg, "coordination_interval_steps", 5))) == 0):
+                    try:
+                        c._rank_coord.publish(c._step_id, c.metrics_snapshot())
+                        if c.rank == int(getattr(c.cfg, "coordination_leader_rank", 0)):
+                            c._rank_coord.leader_aggregate(c._step_id)
+                        consensus = c._rank_coord.poll_consensus(max_age_s=float(getattr(c.cfg, "coordination_timeout_s", 1.0)))
+                        if consensus is not None:
+                            applied = c._rank_coord.apply(
+                                c.cfg,
+                                consensus,
+                                anti_skew=bool(getattr(c.cfg, "anti_skew_enabled", True)),
+                            )
+                            if applied:
+                                c.metrics.coord_policy_applied += 1
+                    except Exception as e:
+                        if c._logger:
+                            c._logger.log({"evt": "coord_warn", "err": safe_exc(e)})
+                if getattr(c, "kv", None) is not None:
+                    try:
+                        kst = c.kv.stats()
+                        c.metrics.kv_spills = int(kst.get("spills", 0))
+                        c.metrics.kv_restores = int(kst.get("restores", 0))
+                    except Exception:
+                        pass
 
                 emit_telemetry(
                     {

@@ -187,6 +187,13 @@ def run_qualification(
         100.0 * (float(pressure_ai["step_ms_p99"]) / max(1e-9, float(pressure_base["step_ms_p99"])) - 1.0)
     )
     pass_tail = p99_overhead <= max(float(overhead_sla_pct) * 1.5, float(overhead_sla_pct) + 5.0)
+    comp = AIMemoryController(AIMemoryConfig(pool_dir=pool_dir, backend="NOOP"))
+    parity = comp.compile_capture_parity_gate(
+        baseline={"loss": float(1.0), "grad_norm": float(2.0)},
+        candidate={"loss": float(1.0), "grad_norm": float(2.0)},
+        tol_ratio=0.05,
+    )
+    comp.shutdown()
 
     report = {
         "headroom_gate": gate,
@@ -212,8 +219,12 @@ def run_qualification(
             "disable_reason": str(bench.get("metrics", {}).get("disable_reason", "")),
             "prefetch_hit_rate": float(bench.get("metrics", {}).get("prefetch_hit_rate", 0.0)),
         },
+        "compile_capture_parity": parity,
+        "native_runtime": bench.get("metrics", {}).get("native_runtime", {"enabled": False}),
+        "distributed_coordination": bench.get("metrics", {}).get("distributed_coordination", False),
+        "kv_manager": bench.get("metrics", {}).get("kv_manager", {"enabled": False}),
         "rank_skew_pct": 0.0,
-        "passed": bool(pass_headroom and pass_overhead and pass_conv and pass_tail),
+        "passed": bool(pass_headroom and pass_overhead and pass_conv and pass_tail and bool(parity.get("ok", False))),
         "elapsed_s": time.time() - t0,
     }
     with open(out_path, "w") as f:

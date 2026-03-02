@@ -71,6 +71,10 @@ class Metrics:
     memory_free_bytes: int = 0
     memory_total_bytes: int = 0
     memory_headroom_pct: float = 0.0
+    static_plan_hits: int = 0
+    coord_policy_applied: int = 0
+    kv_spills: int = 0
+    kv_restores: int = 0
 
     def prefetch_hit_rate(self) -> float:
         d = self.prefetch_hits + self.prefetch_misses

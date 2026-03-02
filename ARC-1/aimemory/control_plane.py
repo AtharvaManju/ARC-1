@@ -79,6 +79,10 @@ def build_fleet_report(pool_dir: str) -> Dict[str, Any]:
     total_restores = sum(int(r.get("restores", 0)) for r in ranks)
     safe_mode_ranks = sum(1 for r in ranks if bool(r.get("safe_mode", False)))
     total_oom_degrades = sum(int(r.get("oom_degrade_count", 0)) for r in ranks)
+    total_static_plan_hits = sum(int(r.get("static_plan_hits", 0)) for r in ranks)
+    total_coord_applied = sum(int(r.get("coord_policy_applied", 0)) for r in ranks)
+    total_kv_spills = sum(int(r.get("kv_spills", 0)) for r in ranks)
+    total_kv_restores = sum(int(r.get("kv_restores", 0)) for r in ranks)
     p95s = [float(r.get("step_p95_ms", 0.0)) for r in ranks if float(r.get("step_p95_ms", 0.0)) > 0.0]
     p99s = [float(r.get("step_p99_ms", 0.0)) for r in ranks if float(r.get("step_p99_ms", 0.0)) > 0.0]
     spills = [int(r.get("spills", 0)) for r in ranks]
@@ -92,6 +96,10 @@ def build_fleet_report(pool_dir: str) -> Dict[str, Any]:
         "total_restores": total_restores,
         "safe_mode_ranks": safe_mode_ranks,
         "total_oom_degrades": total_oom_degrades,
+        "total_static_plan_hits": total_static_plan_hits,
+        "total_coord_policy_applied": total_coord_applied,
+        "total_kv_spills": total_kv_spills,
+        "total_kv_restores": total_kv_restores,
         "fleet_step_p95_ms_max": (max(p95s) if p95s else 0.0),
         "fleet_step_p99_ms_max": (max(p99s) if p99s else 0.0),
         "rank_skew_pct": rank_skew_pct,

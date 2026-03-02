@@ -88,6 +88,37 @@ class AIMemoryConfig:
     deterministic_stream_fences: bool = True
     deterministic_io_ordering: bool = True
 
+    # Native runtime / hot path minimization
+    native_performance_mode: bool = False
+    native_batch_submit: bool = True
+    native_max_batch_ops: int = 64
+    native_flush_interval_ms: float = 0.25
+    native_disable_python_callbacks: bool = False
+
+    # Static spill plan / compile-capture
+    static_plan_mode: bool = False
+    static_plan_dir: str = ""
+    static_plan_key: str = ""
+    static_plan_auto_compile: bool = True
+    compile_capture_parity_gate: bool = True
+    graph_safe_mode: bool = True
+
+    # Distributed coordination
+    distributed_coordination_enabled: bool = True
+    coordination_dir: str = ""
+    coordination_interval_steps: int = 5
+    coordination_leader_rank: int = 0
+    coordination_timeout_s: float = 1.0
+    anti_skew_enabled: bool = True
+    reproducibility_mode: bool = False
+
+    # Inference KV manager
+    kv_manager_enabled: bool = False
+    kv_budget_bytes: int = 8 * 1024**3
+    kv_prefill_prefetch_lookahead: int = 8
+    kv_decode_prefetch_lookahead: int = 1
+    kv_latency_slo_ms: float = 20.0
+
     # Control-plane / agent
     control_plane_dir: str = ""
     policy_name: str = ""
