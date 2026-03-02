@@ -1,7 +1,7 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="aimemory",
+    name="arc1",
     version="0.10.2",
     description="ARC-1: autograd saved-tensor spill/restore with plug-and-play fallbacks",
     packages=find_packages(),
@@ -14,7 +14,7 @@ setup(
         "cryptography",
     ],
     extras_require={
-        "engine": ["aimemory-engine==0.10.2"],
+        "engine": ["arc1-engine==0.10.2"],
         "dashboard": ["rich", "pynvml"],
     },
     entry_points={"console_scripts": ["arc1=aimemory.__main__:main", "aimemory=aimemory.__main__:main"]},

@@ -15,7 +15,7 @@ def main():
             [
                 ".venv/bin/python",
                 "-m",
-                "aimemory",
+                "arc1",
                 "static-plan-compile",
                 "--pool-dir",
                 td,
@@ -33,7 +33,7 @@ def main():
             [
                 ".venv/bin/python",
                 "-m",
-                "aimemory",
+                "arc1",
                 "static-plan-show",
                 "--pool-dir",
                 td,
@@ -48,7 +48,7 @@ def main():
             [
                 ".venv/bin/python",
                 "-m",
-                "aimemory",
+                "arc1",
                 "coord-sync",
                 "--pool-dir",
                 td,
@@ -70,7 +70,7 @@ def main():
             [
                 ".venv/bin/python",
                 "-m",
-                "aimemory",
+                "arc1",
                 "backend-capabilities",
                 "--pool-dir",
                 td,
@@ -99,7 +99,7 @@ def main():
             [
                 ".venv/bin/python",
                 "-m",
-                "aimemory",
+                "arc1",
                 "roi-baseline",
                 "--pool-dir",
                 td,
@@ -118,7 +118,7 @@ def main():
             [
                 ".venv/bin/python",
                 "-m",
-                "aimemory",
+                "arc1",
                 "roi-report",
                 "--pool-dir",
                 td,
@@ -155,7 +155,7 @@ def main():
             [
                 ".venv/bin/python",
                 "-m",
-                "aimemory",
+                "arc1",
                 "memory-slo-check",
                 "--contract",
                 contract,
@@ -195,7 +195,7 @@ def main():
             [
                 ".venv/bin/python",
                 "-m",
-                "aimemory",
+                "arc1",
                 "admission-check",
                 "--job-file",
                 job,
@@ -216,7 +216,7 @@ def main():
             [
                 ".venv/bin/python",
                 "-m",
-                "aimemory",
+                "arc1",
                 "parity-certify",
                 "--baseline",
                 base,
@@ -237,7 +237,7 @@ def main():
             [
                 ".venv/bin/python",
                 "-m",
-                "aimemory",
+                "arc1",
                 "policy-model-add",
                 "--model-dir",
                 os.path.join(td, "pmodel"),
@@ -251,7 +251,7 @@ def main():
             [
                 ".venv/bin/python",
                 "-m",
-                "aimemory",
+                "arc1",
                 "policy-model-predict",
                 "--model-dir",
                 os.path.join(td, "pmodel"),
@@ -268,7 +268,7 @@ def main():
             [
                 ".venv/bin/python",
                 "-m",
-                "aimemory",
+                "arc1",
                 "trace-report",
                 "--trace-file",
                 trace,
@@ -276,6 +276,37 @@ def main():
         )
         j11 = json.loads(out11)
         assert int(j11.get("events", 0)) == 1
+
+        out12 = _run(
+            [
+                ".venv/bin/python",
+                "-m",
+                "arc1",
+                "ga-readiness",
+                "--pool-dir",
+                td,
+            ]
+        )
+        j12 = json.loads(out12)
+        assert "stage" in j12 and "checks" in j12
+
+        out13 = _run(
+            [
+                ".venv/bin/python",
+                "-m",
+                "arc1",
+                "commercial-pack",
+                "--pool-dir",
+                td,
+                "--out-dir",
+                os.path.join(td, "commercial"),
+                "--customer",
+                "demo",
+            ]
+        )
+        j13 = json.loads(out13)
+        assert os.path.exists(j13["json"])
+        assert os.path.exists(j13["markdown"])
     print("CLI_NEW_FEATURES_OK")
 
 

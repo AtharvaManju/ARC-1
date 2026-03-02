@@ -4,8 +4,8 @@ import os
 
 CUDA_HOME = os.environ.get("CUDA_HOME", "/usr/local/cuda")
 
-WITH_URING = os.environ.get("AIMEMORY_WITH_URING", "0") == "1"
-WITH_GDS = os.environ.get("AIMEMORY_WITH_GDS", "0") == "1"
+WITH_URING = os.environ.get("ARC1_WITH_URING", os.environ.get("AIMEMORY_WITH_URING", "0")) == "1"
+WITH_GDS = os.environ.get("ARC1_WITH_GDS", os.environ.get("AIMEMORY_WITH_GDS", "0")) == "1"
 
 define_macros = []
 libraries = []
@@ -24,9 +24,9 @@ if WITH_GDS:
     libraries.append("cufile")
 
 setup(
-    name="aimemory-engine",
+    name="arc1-engine",
     version="0.10.2",
-    description="AIMemory Engine (optional): native NVMe IO + pinned allocator",
+    description="ARC-1 Engine (optional): native NVMe IO + pinned allocator",
     packages=find_packages(),
     include_package_data=True,
     ext_modules=[

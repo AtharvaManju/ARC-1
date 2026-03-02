@@ -21,7 +21,7 @@ pip install "arc1[dashboard]"
 
 Install engine:
 ```bash
-pip install aimemory-engine
+pip install arc1-engine
 ```
 
 ## Important perf note
@@ -40,11 +40,10 @@ arc1.enable()
 
 ## Advanced Start
 ```py
-from aimemory.config import AIMemoryConfig
-from aimemory.controller import AIMemoryController
+from arc1 import ARC1Config, ARC1Controller
 
-cfg = AIMemoryConfig(pool_dir="/mnt/nvme_pool")
-ctrl = AIMemoryController(cfg)
+cfg = ARC1Config(pool_dir="/mnt/nvme_pool")
+ctrl = ARC1Controller(cfg)
 
 with ctrl.step(profiling_warmup=True):
     forward(); loss.backward()
@@ -65,3 +64,5 @@ for _ in range(1000):
 - `arc1 policy-push --pool-dir /mnt/nvme_pool --name prod --file policy.json`
 - `arc1 fleet-report --pool-dir /mnt/nvme_pool`
 - `arc1 agent --bind 0.0.0.0 --port 9765`
+- `arc1 ga-readiness --pool-dir /mnt/nvme_pool --qualification ./aimemory_qualification.json`
+- `arc1 commercial-pack --pool-dir /mnt/nvme_pool --qualification ./aimemory_qualification.json --out-dir ./arc1_pack`

@@ -31,9 +31,9 @@ def run_doctor(pool_dir="/mnt/nvme_pool"):
 
     try:
         import aimemory_engine  # noqa: F401
-        print("  - aimemory-engine:", "INSTALLED")
+        print("  - arc1-engine:", "INSTALLED")
     except Exception:
-        print("  - aimemory-engine:", "NOT INSTALLED (OK; will fallback)")
+        print("  - arc1-engine:", "NOT INSTALLED (OK; will fallback)")
 
     print("  - nvidia-smi:", "OK" if _cmd_ok(["nvidia-smi"]) else "MISSING")
 

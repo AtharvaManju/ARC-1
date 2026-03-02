@@ -38,6 +38,9 @@ class NativeRuntime:
         self.flush_interval_s = max(0.0, float(getattr(cfg, "native_flush_interval_ms", 0.25)) / 1000.0)
         self.chunk_bytes = max(1, int(getattr(cfg, "native_chunk_bytes", 64 * 1024 * 1024)))
         self.inflight_bytes_limit = max(0, int(getattr(cfg, "native_inflight_bytes_limit", 8 * 1024**3)))
+        self.step_budget_bytes = max(0, int(getattr(cfg, "native_step_budget_bytes", 16 * 1024**3)))
+        self.adaptive_batching = bool(getattr(cfg, "native_adaptive_batching", True))
+        self.target_batch_latency_s = max(0.0001, float(getattr(cfg, "native_target_batch_latency_ms", 1.0)) / 1000.0)
 
         self._q: "queue.Queue[NativeSubmit]" = queue.Queue(maxsize=max(64, self.max_batch_ops * 8))
         self._stop = threading.Event()
@@ -52,6 +55,10 @@ class NativeRuntime:
         self._inflight_lock = threading.Lock()
         self._prefetch_plan: List[tuple[str, object]] = []
         self._prefetch_lock = threading.Lock()
+        self._batch_latency_ms_ema = 0.0
+        self._step_bytes: dict[int, int] = {}
+        self._step_lock = threading.Lock()
+        self._budget_denials = 0
 
         if self.enabled:
             self._t = threading.Thread(target=self._loop, daemon=True)
@@ -77,6 +84,8 @@ class NativeRuntime:
             "inflight_limit": int(self.inflight_bytes_limit),
             "fatal": self.fatal(),
             "queue_depth": int(self._q.qsize()),
+            "batch_latency_ms_ema": float(self._batch_latency_ms_ema),
+            "native_budget_denials": int(self._budget_denials),
         }
 
     def update_prefetch_schedule(self, items: List[tuple[str, object]]):
@@ -98,9 +107,19 @@ class NativeRuntime:
         if (not self.enabled) or self._stop.is_set():
             return False
         nbytes = int(t.numel() * t.element_size())
+        if self.step_budget_bytes > 0:
+            with self._step_lock:
+                cur = int(self._step_bytes.get(int(step_id), 0))
+                if (cur + nbytes) > self.step_budget_bytes:
+                    self.metrics.spill_budget_denials += 1
+                    self._budget_denials += 1
+                    return False
+                self._step_bytes[int(step_id)] = cur + nbytes
         with self._inflight_lock:
             if self.inflight_bytes_limit > 0 and (self._inflight_bytes + nbytes) > self.inflight_bytes_limit:
                 self.metrics.inflight_budget_denials += 1
+                with self._step_lock:
+                    self._step_bytes[int(step_id)] = max(0, int(self._step_bytes.get(int(step_id), 0)) - int(nbytes))
                 return False
             self._inflight_bytes += nbytes
         try:
@@ -119,6 +138,8 @@ class NativeRuntime:
         except queue.Full:
             with self._inflight_lock:
                 self._inflight_bytes = max(0, self._inflight_bytes - nbytes)
+            with self._step_lock:
+                self._step_bytes[int(step_id)] = max(0, int(self._step_bytes.get(int(step_id), 0)) - int(nbytes))
             return False
 
     def _set_fatal(self, msg: str):
@@ -130,6 +151,7 @@ class NativeRuntime:
         if not batch:
             return
         self._batches += 1
+        t0_batch = time.time()
         for sub in batch:
             try:
                 t = sub.tensor
@@ -168,6 +190,19 @@ class NativeRuntime:
             finally:
                 with self._inflight_lock:
                     self._inflight_bytes = max(0, self._inflight_bytes - int(sub.nbytes))
+                with self._step_lock:
+                    sid = int(sub.step_id)
+                    self._step_bytes[sid] = max(0, int(self._step_bytes.get(sid, 0)) - int(sub.nbytes))
+        dt = (time.time() - t0_batch) * 1000.0
+        if self._batch_latency_ms_ema <= 0.0:
+            self._batch_latency_ms_ema = float(dt)
+        else:
+            self._batch_latency_ms_ema = 0.2 * float(dt) + 0.8 * float(self._batch_latency_ms_ema)
+        if self.adaptive_batching:
+            if (dt / 1000.0) > self.target_batch_latency_s and self.max_batch_ops > 4:
+                self.max_batch_ops = max(4, int(self.max_batch_ops * 0.8))
+            elif (dt / 1000.0) < (self.target_batch_latency_s * 0.5):
+                self.max_batch_ops = min(256, int(self.max_batch_ops + 2))
 
     def _loop(self):
         batch: list[NativeSubmit] = []

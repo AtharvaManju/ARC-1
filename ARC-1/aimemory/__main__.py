@@ -21,6 +21,7 @@ from aimemory.memory_slo import MemorySLOContract, MemorySLOEnforcer, load_contr
 from aimemory.admission import AdmissionController, JobRequest, load_node_profiles
 from aimemory.parity_cert import certify_from_files
 from aimemory.policy_model import MemoryPolicyModel
+from aimemory.ship_assets import build_ga_readiness, build_commercial_pack
 
 def main():
     p = argparse.ArgumentParser(prog="arc1")
@@ -185,6 +186,17 @@ def main():
 
     tr = sub.add_parser("trace-report")
     tr.add_argument("--trace-file", required=True)
+
+    ga = sub.add_parser("ga-readiness")
+    ga.add_argument("--pool-dir", default="/mnt/nvme_pool")
+    ga.add_argument("--qualification", default="")
+    ga.add_argument("--out", default="")
+
+    cp = sub.add_parser("commercial-pack")
+    cp.add_argument("--pool-dir", default="/mnt/nvme_pool")
+    cp.add_argument("--qualification", default="")
+    cp.add_argument("--out-dir", default="./arc1_commercial_pack")
+    cp.add_argument("--customer", default="")
 
     spc = sub.add_parser("static-plan-compile")
     spc.add_argument("--pool-dir", default="/mnt/nvme_pool")
@@ -429,6 +441,22 @@ def main():
         with open(args.trace_file, "r") as f:
             trc = json.load(f)
         print(json.dumps(trc.get("summary", trc), indent=2))
+        return 0
+    if args.cmd == "ga-readiness":
+        rep = build_ga_readiness(pool_dir=args.pool_dir, qualification_path=str(args.qualification))
+        if args.out:
+            with open(args.out, "w") as f:
+                json.dump(rep, f, indent=2)
+        print(json.dumps(rep, indent=2))
+        return 0
+    if args.cmd == "commercial-pack":
+        rep = build_commercial_pack(
+            pool_dir=args.pool_dir,
+            qualification_path=str(args.qualification),
+            out_dir=str(args.out_dir),
+            customer=str(args.customer),
+        )
+        print(json.dumps(rep, indent=2))
         return 0
     if args.cmd == "static-plan-compile":
         root = f"{args.pool_dir}/static_plans"

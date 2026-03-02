@@ -63,12 +63,18 @@ class RankCoordinator:
                 continue
         return rows
 
-    def leader_aggregate(self, step_id: int) -> Optional[dict]:
+    def leader_aggregate(self, step_id: int, max_rank_stale_s: float = 5.0, min_quorum_ratio: float = 0.75) -> Optional[dict]:
         if self.rank != self.leader_rank:
             return None
         rows = self._read_rank_rows()
         if not rows:
             return None
+        now = time.time()
+        fresh_rows = [r for r in rows if (now - float(r.get("ts", 0.0))) <= float(max_rank_stale_s)]
+        if fresh_rows:
+            rows = fresh_rows
+        quorum = float(len(rows)) / float(max(1, self.world_size))
+        quorum_ok = quorum >= float(max(0.0, min(1.0, min_quorum_ratio)))
         mean_headroom = sum(float(r.get("headroom_pct", 0.0)) for r in rows) / max(1, len(rows))
         min_headroom = min(float(r.get("headroom_pct", 0.0)) for r in rows)
         worst_step_p99 = max(float(r.get("step_p99_ms", 0.0)) for r in rows)
@@ -90,7 +96,9 @@ class RankCoordinator:
             spill_scale *= 1.2
 
         global_level = 0
-        if min_headroom < 6.0 or worst_step_p99 > 150.0 or worst_io_p99 > 60.0:
+        if (not quorum_ok):
+            global_level = 2
+        elif min_headroom < 6.0 or worst_step_p99 > 150.0 or worst_io_p99 > 60.0:
             global_level = 2
         elif min_headroom < 12.0 or worst_step_p99 > 80.0 or worst_io_p99 > 30.0:
             global_level = 1
@@ -120,6 +128,10 @@ class RankCoordinator:
             "spill_threshold_scale": float(spill_scale),
             "prefetch_limit_scale": float(max(0.5, min(1.2, 1.0 - (skew / 200.0)))),
             "per_rank_scale": per_rank_scale,
+            "quorum_ratio": float(quorum),
+            "quorum_ok": bool(quorum_ok),
+            "rows_seen": int(len(rows)),
+            "world_size": int(self.world_size),
         }
         with open(self.consensus_path, "w") as f:
             json.dump(consensus, f, indent=2)

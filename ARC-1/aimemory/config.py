@@ -123,6 +123,9 @@ class AIMemoryConfig:
     native_disable_python_callbacks: bool = False
     native_chunk_bytes: int = 64 * 1024 * 1024
     native_inflight_bytes_limit: int = 8 * 1024**3
+    native_step_budget_bytes: int = 16 * 1024**3
+    native_adaptive_batching: bool = True
+    native_target_batch_latency_ms: float = 1.0
 
     # Static spill plan / compile-capture
     static_plan_mode: bool = False
@@ -131,6 +134,7 @@ class AIMemoryConfig:
     static_plan_auto_compile: bool = True
     compile_capture_parity_gate: bool = True
     graph_safe_mode: bool = True
+    graph_safe_require_static_plan: bool = False
     graph_ring_slots: int = 8
     graph_fixed_bucket_mb: int = 256
 
@@ -140,6 +144,8 @@ class AIMemoryConfig:
     coordination_interval_steps: int = 5
     coordination_leader_rank: int = 0
     coordination_timeout_s: float = 1.0
+    coordination_rank_stale_s: float = 5.0
+    coordination_min_quorum_ratio: float = 0.75
     anti_skew_enabled: bool = True
     reproducibility_mode: bool = False
     topology_awareness_enabled: bool = True
@@ -153,6 +159,7 @@ class AIMemoryConfig:
     kv_eviction_policy: str = "LRU"  # LRU | CLOCK
     kv_tenant_fairness: bool = True
     kv_tenant_budget_ratio: float = 0.25
+    kv_hard_tenant_cap: bool = False
 
     # Control-plane / agent
     control_plane_dir: str = ""
@@ -203,3 +210,6 @@ class AIMemoryConfig:
     memory_trace_enabled: bool = True
     memory_trace_max_events: int = 20000
     memory_trace_out_path: str = ""
+
+    # GA/commercial artifacts
+    commercial_artifacts_dir: str = ""

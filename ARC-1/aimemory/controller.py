@@ -480,11 +480,30 @@ class AIMemoryController:
             self.metrics.prefetch_dropped += 1
 
     def _submit_lookahead_prefetch(self):
+        native_items: list[tuple[str, Any]] = []
+        def _collect_native_item(pack_idx: int):
+            if self.storage is None:
+                return
+            if pack_idx not in self._step_keys_by_pack:
+                return
+            key = self._step_keys_by_pack[pack_idx]
+            done_evt = self._spill_done_events.get(key)
+            if done_evt is not None and not done_evt.is_set():
+                return
+            try:
+                meta = self.storage.get_meta(key)
+            except Exception:
+                return
+            native_items.append((key, meta))
+
         if bool(getattr(self.cfg, "static_plan_mode", False)) and self._static_plan is not None:
             lim = max(1, int(getattr(self.cfg, "prefetch_batch_limit", 8)))
             for pidx in self._static_plan_entries[:lim]:
+                _collect_native_item(int(pidx))
                 self._maybe_submit_prefetch_for_pack(int(pidx))
                 self.metrics.static_plan_hits += 1
+            if (self._native_runtime is not None) and native_items:
+                self._native_runtime.update_prefetch_schedule(native_items)
             return
         if not self.pcc.enabled or self.pcc.mode != "EXECUTION":
             return
@@ -501,7 +520,10 @@ class AIMemoryController:
             if qd >= int(0.75 * q_cap):
                 lim = 1
         for pidx in self.pcc.next_prefetch_pack_indices()[:lim]:
+            _collect_native_item(int(pidx))
             self._maybe_submit_prefetch_for_pack(int(pidx))
+        if (self._native_runtime is not None) and native_items:
+            self._native_runtime.update_prefetch_schedule(native_items)
 
     def _pack_hook(self, t: torch.Tensor) -> PackedRef:
         self._pack_counter += 1
@@ -532,6 +554,14 @@ class AIMemoryController:
 
         if bool(getattr(self.cfg, "compile_safe_mode", True)) and self._is_compiling():
             _trace_inline("compile_safe_mode")
+            return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
+        if (
+            bool(getattr(self.cfg, "graph_safe_mode", True))
+            and bool(getattr(self.cfg, "static_plan_mode", False))
+            and bool(getattr(self.cfg, "graph_safe_require_static_plan", False))
+            and (self._static_plan is None)
+        ):
+            _trace_inline("graph_safe_missing_static_plan")
             return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
 
         if self._noop or (not t.is_cuda):
@@ -912,6 +942,17 @@ class AIMemoryController:
             if c._noop:
                 return self
 
+            if (
+                bool(getattr(c.cfg, "graph_safe_mode", True))
+                and bool(getattr(c.cfg, "static_plan_mode", False))
+                and bool(getattr(c.cfg, "graph_safe_require_static_plan", False))
+                and (c._static_plan is None)
+                and (not c._profiling)
+            ):
+                c.metrics.spilling_enabled = False
+                c.metrics.safe_mode = True
+                c.metrics.disable_reason = "graph_safe_mode requires static plan"
+
             if bool(getattr(c.cfg, "native_disable_python_callbacks", False)):
                 # Explicit bypass mode for environments that run a native/autograph integration.
                 c.metrics.disable_reason = "python_callbacks_bypassed"
@@ -970,7 +1011,11 @@ class AIMemoryController:
                     try:
                         c._rank_coord.publish(c._step_id, c.metrics_snapshot(), topology=(c._topology if bool(getattr(c.cfg, "topology_awareness_enabled", True)) else {}))
                         if c.rank == int(getattr(c.cfg, "coordination_leader_rank", 0)):
-                            c._rank_coord.leader_aggregate(c._step_id)
+                            c._rank_coord.leader_aggregate(
+                                c._step_id,
+                                max_rank_stale_s=float(getattr(c.cfg, "coordination_rank_stale_s", 5.0)),
+                                min_quorum_ratio=float(getattr(c.cfg, "coordination_min_quorum_ratio", 0.75)),
+                            )
                         consensus = c._rank_coord.poll_consensus(max_age_s=float(getattr(c.cfg, "coordination_timeout_s", 1.0)))
                         if consensus is not None:
                             applied = c._rank_coord.apply(
