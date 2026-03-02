@@ -21,6 +21,7 @@ from .logging_jsonl import JsonlLogger, default_rank_log_path, safe_exc
 from .gc import gc_windows_if_needed
 from .autotune import RuntimeAutoTuner
 from .control_plane import PolicyStore
+from .governor import MemoryGovernor
 
 @dataclass
 class PackedRef:
@@ -107,6 +108,7 @@ class AIMemoryController:
                 max_queue=cfg.max_queue,
                 pinned_pool_bytes=cfg.pinned_pool_bytes,
                 stream_priority=cfg.prefetch_stream_priority,
+                enforce_ordering=bool(getattr(cfg, "deterministic_io_ordering", True)),
             )
 
         self._step_id = 0
@@ -124,6 +126,13 @@ class AIMemoryController:
         self._step_spills_start: int = 0
         self._agent_metrics_path = os.path.join(cfg.pool_dir, f"rank_{self.rank}", "agent_metrics.json")
         self._autotuner = RuntimeAutoTuner(cfg, self.metrics)
+        self._governor = MemoryGovernor(cfg, self.metrics)
+        self._spill_stream: Optional[torch.cuda.Stream] = None
+        self._restore_stream: Optional[torch.cuda.Stream] = None
+        self._spill_order_evt: Optional[torch.cuda.Event] = None
+        if (not self._noop) and bool(getattr(cfg, "deterministic_stream_fences", True)):
+            self._spill_stream = torch.cuda.Stream(priority=int(cfg.prefetch_stream_priority))
+            self._restore_stream = torch.cuda.Stream(priority=int(cfg.prefetch_stream_priority))
 
         if self._logger:
             self._logger.log({"evt": "init", "rank": self.rank, "world": self.world_size, "backend": self.backend})
@@ -180,8 +189,16 @@ class AIMemoryController:
             "pcc_enabled": m.pcc_enabled,
             "pcc_drift_count": m.pcc_drift_count,
             "queue_depth": (self.io.queue_depth() if self.io else 0),
+            "step_p95_ms": m.step_hist.pct(95),
+            "step_p99_ms": m.step_hist.pct(99),
             "spill_min_bytes": int(self.cfg.spill_min_bytes),
             "pcc_lookahead": int(self.cfg.pcc_lookahead),
+            "governor_level": int(m.governor_level),
+            "governor_adjustments": int(m.governor_adjustments),
+            "oom_degrade_count": int(m.oom_degrade_count),
+            "memory_headroom_pct": float(m.memory_headroom_pct),
+            "memory_free_bytes": int(m.memory_free_bytes),
+            "memory_total_bytes": int(m.memory_total_bytes),
             "engine_native": bool((self.storage is not None) and (self.storage.engine._native is not None)),
             "engine_gds": bool((self.storage is not None) and self.storage.engine.gds_enabled()),
             "engine_uring": bool((self.storage is not None) and self.storage.engine.uring_enabled()),
@@ -226,7 +243,14 @@ class AIMemoryController:
     def _submit_lookahead_prefetch(self):
         if not self.pcc.enabled or self.pcc.mode != "EXECUTION":
             return
+        if int(getattr(self.metrics, "governor_level", 0)) >= 2:
+            return
         lim = max(1, int(getattr(self.cfg, "prefetch_batch_limit", 8)))
+        if self.io is not None:
+            qd = int(self.io.queue_depth())
+            q_cap = max(1, int(getattr(self.cfg, "max_queue", 1)))
+            if qd >= int(0.75 * q_cap):
+                lim = 1
         for pidx in self.pcc.next_prefetch_pack_indices()[:lim]:
             self._maybe_submit_prefetch_for_pack(int(pidx))
 
@@ -243,6 +267,13 @@ class AIMemoryController:
         nbytes = int(t.numel() * t.element_size())
         if (not self.metrics.spilling_enabled) or self.metrics.safe_mode or (nbytes < int(self.cfg.spill_min_bytes)):
             return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
+        if self.io is not None:
+            fatal = self.io.fatal_error()
+            if fatal is not None and bool(getattr(self.cfg, "fail_open_on_error", True)):
+                self.metrics.spilling_enabled = False
+                self.metrics.safe_mode = True
+                self.metrics.disable_reason = f"Fail-open after IO error: {fatal}"
+                return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
 
         if not t.is_contiguous():
             t = t.contiguous()
@@ -263,10 +294,20 @@ class AIMemoryController:
             return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
 
         src_u8 = t.view(torch.uint8).reshape(-1)
-        blk.u8[:nbytes].copy_(src_u8, non_blocking=True)
-
         ready_evt = torch.cuda.Event(enable_timing=False, blocking=False)
-        ready_evt.record(torch.cuda.current_stream())
+        if self._spill_stream is not None:
+            gate_evt = torch.cuda.Event(enable_timing=False, blocking=False)
+            gate_evt.record(torch.cuda.current_stream())
+            with torch.cuda.stream(self._spill_stream):
+                self._spill_stream.wait_event(gate_evt)
+                if self._spill_order_evt is not None:
+                    self._spill_stream.wait_event(self._spill_order_evt)
+                blk.u8[:nbytes].copy_(src_u8, non_blocking=True)
+                ready_evt.record(self._spill_stream)
+            self._spill_order_evt = ready_evt
+        else:
+            blk.u8[:nbytes].copy_(src_u8, non_blocking=True)
+            ready_evt.record(torch.cuda.current_stream())
 
         done_evt = self.io.spill_done_event(key)
         self._spill_done_events[key] = done_evt
@@ -333,6 +374,14 @@ class AIMemoryController:
             done_evt.wait()
             fatal = self.io.fatal_error()
             if fatal is not None:
+                if bool(getattr(self.cfg, "fail_open_on_error", True)):
+                    self.metrics.spilling_enabled = False
+                    self.metrics.safe_mode = True
+                    self.metrics.disable_reason = f"Fail-open after commit error: {fatal}"
+                    self.io.clear_spill_done(key)
+                    self._spill_done_events.pop(key, None)
+                    self._step_keys_by_pack.pop(pack_idx, None)
+                    return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
                 raise RuntimeError(f"AIMemory spill commit failed for key={key}: {fatal}")
 
         self.metrics.spills += 1
@@ -346,10 +395,11 @@ class AIMemoryController:
 
         assert self.storage is not None and self.io is not None
 
-        # FIX #6: fail fast if worker already hit fatal IO error
         fatal = self.io.fatal_error()
-        if fatal is not None:
-            raise RuntimeError(f"AIMemory IO fatal error (disable AIMemory or fix IO): {fatal}")
+        if fatal is not None and bool(getattr(self.cfg, "fail_open_on_error", True)):
+            self.metrics.spilling_enabled = False
+            self.metrics.safe_mode = True
+            self.metrics.disable_reason = f"Fail-open after IO error: {fatal}"
 
         if self._profiling:
             self.pcc.record_restore(ref.pack_idx)
@@ -361,9 +411,6 @@ class AIMemoryController:
             done_evt.wait()
             dt_ms = (time.time() - t0) * 1000.0
             self.metrics.spill_commit_wait_ms_ema.update(dt_ms)
-            fatal = self.io.fatal_error()
-            if fatal is not None:
-                raise RuntimeError(f"AIMemory spill commit failed for key={key}: {fatal}")
 
         out = None
         try:
@@ -379,30 +426,62 @@ class AIMemoryController:
                 try:
                     meta = self.storage.get_meta(key)
                 except KeyError as e:
-                    fatal = self.io.fatal_error()
-                    if fatal is not None:
-                        raise RuntimeError(f"AIMemory spill commit failed for key={key}: {fatal}") from e
-                    raise
+                    if not self.storage.wait_until_readable(
+                        key=key,
+                        timeout_s=float(getattr(self.cfg, "unpack_meta_wait_timeout_s", 2.0)),
+                        poll_s=float(getattr(self.cfg, "unpack_meta_wait_poll_s", 0.002)),
+                    ):
+                        fatal = self.io.fatal_error()
+                        if fatal is not None:
+                            raise RuntimeError(f"AIMemory spill commit failed for key={key}: {fatal}") from e
+                        raise
+                    meta = self.storage.get_meta(key)
 
                 enc_blk = None
-                scratch = None
+                plain_blk = None
+                work_blk = None
+                owns_plain = False
+                owns_work = False
                 try:
                     enc_blk = self.storage.acquire_pinned(meta.padded_bytes)
+                    try:
+                        self.storage.mark_prefetching(key)
+                    except Exception:
+                        pass
                     self.storage.read_block_to_pinned(meta, enc_blk)
 
-                    out = torch.empty(meta.shape, device="cuda", dtype=str_to_dtype(meta.dtype_s))
-                    if meta.encrypted:
-                        scratch = self.storage.acquire_pinned(meta.nbytes)
+                    plain_blk, work_blk, owns_plain, owns_work = self.storage.decode_to_plain_block(
+                        meta, enc_blk, scratch_plain=None, scratch_work=None
+                    )
 
-                    self.storage.restore_to_cuda_from_pinned(meta, enc_blk, out, scratch_plain=scratch)
+                    out = torch.empty(meta.shape, device="cuda", dtype=str_to_dtype(meta.dtype_s))
+                    src_u8 = plain_blk.u8[:meta.nbytes].view(torch.uint8).reshape(-1)
+                    out_u8 = out.view(torch.uint8).reshape(-1)
+                    if self._restore_stream is not None:
+                        evt = torch.cuda.Event(enable_timing=False, blocking=False)
+                        with torch.cuda.stream(self._restore_stream):
+                            out_u8.copy_(src_u8, non_blocking=True)
+                            evt.record(self._restore_stream)
+                        torch.cuda.current_stream().wait_event(evt)
+                    else:
+                        out_u8.copy_(src_u8, non_blocking=True)
+                    try:
+                        self.storage.mark_resident(key)
+                    except Exception:
+                        pass
+                    self.storage.mark_restored(key)
                     out.record_stream(torch.cuda.current_stream())
                 finally:
                     if enc_blk is not None:
                         self.storage.release_pinned(enc_blk)
-                    if scratch is not None:
-                        self.storage.release_pinned(scratch)
+                    if owns_plain and plain_blk is not None:
+                        self.storage.release_pinned(plain_blk)
+                    if owns_work and work_blk is not None:
+                        self.storage.release_pinned(work_blk)
 
         except Exception as e:
+            if "out of memory" in str(e).lower():
+                self._governor.on_oom_signal(self._step_id)
             self.metrics.spilling_enabled = False
             self.metrics.safe_mode = True
             self.metrics.disable_reason = f"Restore failed: {type(e).__name__}: {e}"
@@ -440,6 +519,7 @@ class AIMemoryController:
             c._prefetch_submitted_pack.clear()
             c._spill_done_events.clear()
             c._step_spills_start = int(c.metrics.spills)
+            c._spill_order_evt = None
 
             c.pcc.reset_step()
 
@@ -487,6 +567,7 @@ class AIMemoryController:
                 c.policy.enforce_sla(c._step_id, dt_ms)
                 c.policy.maybe_reenable(c._step_id)
                 c._autotuner.observe_step(c._step_id)
+                c._governor.observe_step(c._step_id)
                 c.pcc.lookahead = int(c.cfg.pcc_lookahead)
 
                 emit_telemetry(
@@ -500,6 +581,10 @@ class AIMemoryController:
                         "disable_reason": c.metrics.disable_reason,
                         "pcc_enabled": c.metrics.pcc_enabled,
                         "pcc_drift": c.metrics.pcc_drift_count,
+                        "governor_level": c.metrics.governor_level,
+                        "memory_headroom_pct": c.metrics.memory_headroom_pct,
+                        "step_p95_ms": c.metrics.step_hist.pct(95),
+                        "step_p99_ms": c.metrics.step_hist.pct(99),
                         "backend": c.backend,
                         "rank": c.rank,
                     },

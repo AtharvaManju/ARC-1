@@ -65,6 +65,12 @@ class Metrics:
     spill_commit_wait_ms_ema: EMA = field(default_factory=lambda: EMA(alpha=0.2))
 
     backend: str = "AUTO"
+    governor_level: int = 0
+    governor_adjustments: int = 0
+    oom_degrade_count: int = 0
+    memory_free_bytes: int = 0
+    memory_total_bytes: int = 0
+    memory_headroom_pct: float = 0.0
 
     def prefetch_hit_rate(self) -> float:
         d = self.prefetch_hits + self.prefetch_misses

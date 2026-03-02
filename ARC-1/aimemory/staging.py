@@ -52,6 +52,10 @@ class OverlapPipeline:
         plain_blk = None
         work_blk = None
         try:
+            try:
+                self.storage.mark_prefetching(key)
+            except Exception:
+                pass
             self.storage.read_block_to_pinned(meta, enc_blk)
             plain_blk, work_blk, owns_plain, owns_work = self.storage.decode_to_plain_block(meta, enc_blk, scratch_plain=None, scratch_work=None)
             if not owns_plain:
@@ -77,6 +81,10 @@ class OverlapPipeline:
             pr.plain_block = plain_blk
             pr.work_block = work_blk
             pr.ready.set()
+            try:
+                self.storage.mark_resident(key)
+            except Exception:
+                pass
 
         except Exception:
             pr.ready.set()
@@ -85,4 +93,8 @@ class OverlapPipeline:
                 self.pool.release(plain_blk)
             if work_blk is not None:
                 self.pool.release(work_blk)
+            try:
+                self.storage.mark_evictable(key)
+            except Exception:
+                pass
             raise

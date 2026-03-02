@@ -27,9 +27,10 @@ class PrefetchJob:
 
 class IOWorkers:
     def __init__(self, storage: SARCStorage, metrics: Metrics, num_workers: int, max_queue: int,
-                 pinned_pool_bytes: int, stream_priority: int):
+                 pinned_pool_bytes: int, stream_priority: int, enforce_ordering: bool = False):
         self.storage = storage
         self.metrics = metrics
+        self._enforce_ordering = bool(enforce_ordering)
 
         alloc_fn = lambda n: storage.engine.alloc_pinned_u8(n)
         self.pool = PinnedBlockPool(alloc_fn=alloc_fn, max_bytes=pinned_pool_bytes)
@@ -47,7 +48,8 @@ class IOWorkers:
         self._fatal_io_error: Optional[str] = None
 
         self._threads = []
-        for _ in range(max(1, num_workers)):
+        worker_count = 1 if self._enforce_ordering else max(1, num_workers)
+        for _ in range(worker_count):
             t = threading.Thread(target=self._loop, daemon=True)
             t.start()
             self._threads.append(t)
@@ -143,6 +145,10 @@ class IOWorkers:
             self.pool.release(popped.plain_block)
         if popped and popped.work_block is not None:
             self.pool.release(popped.work_block)
+        try:
+            self.storage.mark_released(key)
+        except Exception:
+            pass
         try:
             self.storage.mark_restored(key)
         except Exception:

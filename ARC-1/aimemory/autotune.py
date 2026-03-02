@@ -1,8 +1,11 @@
 import json
 import os
 import hashlib
+import platform
 from dataclasses import dataclass
 from typing import Optional
+
+import torch
 
 
 @dataclass
@@ -32,7 +35,22 @@ class RuntimeAutoTuner:
     def _fingerprint(self) -> str:
         base = str(getattr(self.cfg, "model_profile_name", "") or "default")
         backend = str(getattr(self.m, "backend", "AUTO"))
-        raw = f"{base}:{backend}:{int(getattr(self.cfg, 'world_size', -1))}"
+        world = int(getattr(self.cfg, "world_size", -1))
+        cuda_ver = str(getattr(torch.version, "cuda", "") or "none")
+        torch_ver = str(getattr(torch, "__version__", "unknown"))
+        dev_count = int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+        dev_names = []
+        if torch.cuda.is_available():
+            for i in range(dev_count):
+                try:
+                    dev_names.append(torch.cuda.get_device_name(i))
+                except Exception:
+                    dev_names.append("unknown")
+        topo = ",".join(dev_names)
+        raw = (
+            f"{base}:{backend}:{world}:{cuda_ver}:{torch_ver}:"
+            f"{platform.system()}:{platform.machine()}:{dev_count}:{topo}"
+        )
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
     def _load_profile(self):

@@ -74,6 +74,20 @@ class AIMemoryConfig:
     autotune_adjust_interval_steps: int = 10
     model_profile_name: str = ""
 
+    # Pressure governor (OOM-as-degrade)
+    governor_enabled: bool = True
+    governor_warn_headroom_pct: float = 12.0
+    governor_emergency_headroom_pct: float = 6.0
+    governor_cooldown_steps: int = 5
+    governor_spill_min_floor_bytes: int = 1 * 1024 * 1024
+    fail_open_on_error: bool = True
+    unpack_meta_wait_timeout_s: float = 2.0
+    unpack_meta_wait_poll_s: float = 0.002
+
+    # Determinism / stream semantics
+    deterministic_stream_fences: bool = True
+    deterministic_io_ordering: bool = True
+
     # Control-plane / agent
     control_plane_dir: str = ""
     policy_name: str = ""

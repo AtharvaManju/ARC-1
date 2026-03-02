@@ -1,7 +1,7 @@
 import tempfile
 import torch
 
-from aimemory.storage import SARCStorage, STATUS_COMMITTED, STATUS_RESTORED
+from aimemory.storage import SARCStorage, STATUS_EVICTABLE, STATUS_RESTORED
 
 
 def main():
@@ -26,7 +26,7 @@ def main():
             step_id=0,
         )
         got = st.get_meta("k1")
-        assert got.status_s == STATUS_COMMITTED
+        assert got.status_s == STATUS_EVICTABLE
         assert int(got.stored_nbytes) > 0
         st.mark_restored("k1")
         got2 = st.get_meta("k1")

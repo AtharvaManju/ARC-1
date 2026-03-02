@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import numpy as np
 import torch
 
 from aimemory.config import AIMemoryConfig
@@ -48,6 +49,8 @@ def run_bench(pool_dir="/mnt/nvme_pool", steps=30, warmup=10, out_dir="./aimemor
         "steps": steps,
         "warmup": warmup,
         "step_ms_avg": sum(times) / max(1, len(times)),
+        "step_ms_p95": float(np.percentile(np.array(times, dtype=np.float64), 95)) if times else 0.0,
+        "step_ms_p99": float(np.percentile(np.array(times, dtype=np.float64), 99)) if times else 0.0,
         "metrics": ctrl.metrics_snapshot(),
         "config": cfg.__dict__,
     }

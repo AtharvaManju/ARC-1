@@ -78,11 +78,22 @@ def build_fleet_report(pool_dir: str) -> Dict[str, Any]:
     total_spills = sum(int(r.get("spills", 0)) for r in ranks)
     total_restores = sum(int(r.get("restores", 0)) for r in ranks)
     safe_mode_ranks = sum(1 for r in ranks if bool(r.get("safe_mode", False)))
+    total_oom_degrades = sum(int(r.get("oom_degrade_count", 0)) for r in ranks)
+    p95s = [float(r.get("step_p95_ms", 0.0)) for r in ranks if float(r.get("step_p95_ms", 0.0)) > 0.0]
+    p99s = [float(r.get("step_p99_ms", 0.0)) for r in ranks if float(r.get("step_p99_ms", 0.0)) > 0.0]
+    spills = [int(r.get("spills", 0)) for r in ranks]
+    rank_skew_pct = 0.0
+    if spills and max(spills) > 0:
+        rank_skew_pct = 100.0 * float(max(spills) - min(spills)) / float(max(spills))
     return {
         "ok": True,
         "ranks_seen": len(ranks),
         "total_spills": total_spills,
         "total_restores": total_restores,
         "safe_mode_ranks": safe_mode_ranks,
+        "total_oom_degrades": total_oom_degrades,
+        "fleet_step_p95_ms_max": (max(p95s) if p95s else 0.0),
+        "fleet_step_p99_ms_max": (max(p99s) if p99s else 0.0),
+        "rank_skew_pct": rank_skew_pct,
         "ranks": ranks,
     }

@@ -57,6 +57,7 @@ def main():
             "consistency": cons,
             "fleet": fleet,
             "policy_applied": {"spill_min_bytes": cfg.spill_min_bytes, "pcc_lookahead": cfg.pcc_lookahead},
+            "manifest_replay_ok": bool(cons.get("manifest", {}).get("ok", True)),
         }
         print(json.dumps(report, indent=2))
     print("PRODUCT_SIMULATION_OK")

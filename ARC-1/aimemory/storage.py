@@ -2,6 +2,8 @@ import os
 import sqlite3
 import threading
 import zlib
+import time
+import json
 from dataclasses import dataclass
 from typing import Tuple, Optional, Dict, List
 
@@ -36,14 +38,106 @@ class TensorMeta:
     stored_nbytes: int = 0
     codec: str = "none"
     restored_count: int = 0
+    chunk_manifest_json: str = ""
 
 
 STATUS_RESERVED = "RESERVED"
 STATUS_WRITING = "WRITING"
 STATUS_COMMITTED = "COMMITTED"
+STATUS_EVICTABLE = "EVICTABLE"
+STATUS_PREFETCHING = "PREFETCHING"
+STATUS_RESIDENT = "RESIDENT"
+STATUS_RELEASED = "RELEASED"
 STATUS_RESTORED = "RESTORED"
 STATUS_FAILED = "FAILED"
-VALID_STATUSES = {STATUS_RESERVED, STATUS_WRITING, STATUS_COMMITTED, STATUS_RESTORED, STATUS_FAILED}
+VALID_STATUSES = {
+    STATUS_RESERVED,
+    STATUS_WRITING,
+    STATUS_COMMITTED,
+    STATUS_EVICTABLE,
+    STATUS_PREFETCHING,
+    STATUS_RESIDENT,
+    STATUS_RELEASED,
+    STATUS_RESTORED,
+    STATUS_FAILED,
+}
+READABLE_STATUSES = {
+    STATUS_COMMITTED,
+    STATUS_EVICTABLE,
+    STATUS_PREFETCHING,
+    STATUS_RESIDENT,
+    STATUS_RESTORED,
+}
+ALLOWED_TRANSITIONS = {
+    STATUS_RESERVED: {STATUS_WRITING, STATUS_FAILED},
+    STATUS_WRITING: {STATUS_COMMITTED, STATUS_FAILED},
+    STATUS_COMMITTED: {STATUS_EVICTABLE, STATUS_PREFETCHING, STATUS_RESIDENT, STATUS_RESTORED, STATUS_RELEASED, STATUS_FAILED},
+    STATUS_EVICTABLE: {STATUS_PREFETCHING, STATUS_RESIDENT, STATUS_RESTORED, STATUS_RELEASED, STATUS_FAILED},
+    STATUS_PREFETCHING: {STATUS_RESIDENT, STATUS_RESTORED, STATUS_EVICTABLE, STATUS_FAILED},
+    STATUS_RESIDENT: {STATUS_RESTORED, STATUS_RELEASED, STATUS_EVICTABLE, STATUS_FAILED},
+    STATUS_RESTORED: {STATUS_RESIDENT, STATUS_RELEASED, STATUS_EVICTABLE, STATUS_FAILED},
+    STATUS_RELEASED: {STATUS_EVICTABLE, STATUS_PREFETCHING, STATUS_RESIDENT, STATUS_RESTORED, STATUS_FAILED},
+    STATUS_FAILED: set(),
+}
+
+
+def _try_import_xxhash():
+    try:
+        import xxhash  # type: ignore
+        return xxhash
+    except Exception:
+        return None
+
+
+def build_chunk_manifest(payload: bytes, chunk_size: int = 1 * 1024 * 1024) -> str:
+    if chunk_size <= 0:
+        chunk_size = 1 * 1024 * 1024
+    xxh = _try_import_xxhash()
+    chunks = []
+    off = 0
+    total = len(payload)
+    while off < total:
+        part = payload[off:off + chunk_size]
+        row = {
+            "off": off,
+            "n": len(part),
+            "crc32": int(zlib.crc32(part) & 0xFFFFFFFF),
+        }
+        if xxh is not None:
+            row["xxh64"] = xxh.xxh64(part).hexdigest()
+        chunks.append(row)
+        off += chunk_size
+    manifest = {"chunk_size": int(chunk_size), "chunks": chunks}
+    return json.dumps(manifest, separators=(",", ":"))
+
+
+def verify_chunk_manifest(payload: bytes, manifest_json: str) -> bool:
+    if not manifest_json:
+        return True
+    xxh = _try_import_xxhash()
+    try:
+        m = json.loads(manifest_json)
+        chunks = list(m.get("chunks", []))
+    except Exception:
+        return False
+    for c in chunks:
+        off = int(c["off"])
+        n = int(c["n"])
+        part = payload[off:off + n]
+        if len(part) != n:
+            return False
+        if int(zlib.crc32(part) & 0xFFFFFFFF) != int(c["crc32"]):
+            return False
+        if "xxh64" in c and xxh is not None:
+            if xxh.xxh64(part).hexdigest() != str(c["xxh64"]):
+                return False
+    return True
+
+
+def is_valid_transition(prev_state: str, next_state: str) -> bool:
+    if prev_state == next_state:
+        return True
+    return next_state in ALLOWED_TRANSITIONS.get(prev_state, set())
 
 def crc32_u8(u8: torch.Tensor, nbytes: int) -> int:
     arr = u8[:nbytes].contiguous().numpy()
@@ -215,6 +309,7 @@ class SARCStorage:
                 compressed INTEGER NOT NULL DEFAULT 0,
                 stored_nbytes INTEGER NOT NULL DEFAULT 0,
                 codec TEXT NOT NULL DEFAULT 'none',
+                chunk_manifest TEXT NOT NULL DEFAULT '',
                 restored_count INTEGER NOT NULL DEFAULT 0,
                 crc32 INTEGER NOT NULL
             )
@@ -223,6 +318,15 @@ class SARCStorage:
             CREATE TABLE IF NOT EXISTS meta (
                 k TEXT PRIMARY KEY,
                 v TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS manifest_events (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                key TEXT NOT NULL,
+                state TEXT NOT NULL,
+                ts REAL NOT NULL,
+                details TEXT NOT NULL DEFAULT ''
             )
         """)
         conn.commit()
@@ -244,9 +348,20 @@ class SARCStorage:
             conn.execute("UPDATE tensors SET stored_nbytes=nbytes WHERE stored_nbytes=0")
         if "codec" not in cols:
             conn.execute("ALTER TABLE tensors ADD COLUMN codec TEXT NOT NULL DEFAULT 'none'")
+        if "chunk_manifest" not in cols:
+            conn.execute("ALTER TABLE tensors ADD COLUMN chunk_manifest TEXT NOT NULL DEFAULT ''")
         if "restored_count" not in cols:
             conn.execute("ALTER TABLE tensors ADD COLUMN restored_count INTEGER NOT NULL DEFAULT 0")
-        conn.execute("PRAGMA user_version=2;")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS manifest_events (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                key TEXT NOT NULL,
+                state TEXT NOT NULL,
+                ts REAL NOT NULL,
+                details TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        conn.execute("PRAGMA user_version=3;")
         conn.commit()
         conn.close()
 
@@ -281,8 +396,14 @@ class SARCStorage:
         conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=%s;" % ("FULL" if self.durable else "NORMAL"))
-        conn.execute("DELETE FROM tensors WHERE committed=0 OR status IN (?, ?, ?)", (STATUS_RESERVED, STATUS_WRITING, STATUS_FAILED))
-        conn.execute("UPDATE tensors SET status=? WHERE committed=1 AND status NOT IN (?, ?)", (STATUS_COMMITTED, STATUS_COMMITTED, STATUS_RESTORED))
+        conn.execute(
+            "DELETE FROM tensors WHERE committed=0 OR status IN (?, ?, ?, ?)",
+            (STATUS_RESERVED, STATUS_WRITING, STATUS_FAILED, STATUS_PREFETCHING),
+        )
+        conn.execute(
+            "UPDATE tensors SET status=? WHERE committed=1 AND status NOT IN (?, ?, ?, ?)",
+            (STATUS_EVICTABLE, STATUS_EVICTABLE, STATUS_RESIDENT, STATUS_RESTORED, STATUS_RELEASED),
+        )
 
         rows = conn.execute("SELECT pool_id, MAX(offset + padded_bytes) FROM tensors WHERE committed=1 GROUP BY pool_id").fetchall()
         for pool_id, max_end in rows:
@@ -295,12 +416,18 @@ class SARCStorage:
             pass
         conn.commit()
         conn.close()
+        # Best-effort drift report; recover should never fail because of manifest parse.
+        try:
+            self.replay_manifest(repair=True)
+        except Exception:
+            pass
 
     def mark_failed(self, key: str):
         conn = self._conn()
         conn.execute("UPDATE tensors SET status=? WHERE key=?", (STATUS_FAILED, key))
         conn.execute("DELETE FROM tensors WHERE key=? AND committed=0", (key,))
         conn.commit()
+        self._append_manifest_event(key, STATUS_FAILED, "")
 
     # --- pooled pinned helpers ---
     def acquire_pinned(self, nbytes: int) -> PinnedBlock:
@@ -367,13 +494,104 @@ class SARCStorage:
         if status_s not in VALID_STATUSES:
             raise ValueError(f"invalid status: {status_s}")
         conn = self._conn()
+        row = conn.execute("SELECT status, committed FROM tensors WHERE key=?", (key,)).fetchone()
+        if row is None:
+            raise KeyError(key)
+        prev_status, committed = str(row[0]), int(row[1])
+        if not is_valid_transition(prev_status, status_s):
+            raise RuntimeError(f"invalid state transition key={key}: {prev_status}->{status_s}")
+        if committed != 1 and status_s in READABLE_STATUSES:
+            raise RuntimeError(f"illegal readable status before commit for key={key}: {status_s}")
         conn.execute("UPDATE tensors SET status=? WHERE key=?", (status_s, key))
+        conn.commit()
+        self._append_manifest_event(key, status_s, "")
+
+    def _append_manifest_event(self, key: str, state: str, details: str):
+        conn = self._conn()
+        conn.execute(
+            "INSERT INTO manifest_events(key, state, ts, details) VALUES(?,?,?,?)",
+            (str(key), str(state), float(time.time()), str(details or "")),
+        )
         conn.commit()
 
     def mark_restored(self, key: str):
         conn = self._conn()
-        conn.execute("UPDATE tensors SET status=?, restored_count=restored_count+1 WHERE key=? AND committed=1", (STATUS_RESTORED, key))
+        row = conn.execute("SELECT status, committed FROM tensors WHERE key=?", (key,)).fetchone()
+        if row is None:
+            raise KeyError(key)
+        prev_status, committed = str(row[0]), int(row[1])
+        if committed != 1:
+            raise RuntimeError(f"restore attempted before commit for key={key}")
+        if not is_valid_transition(prev_status, STATUS_RESTORED):
+            raise RuntimeError(f"invalid state transition key={key}: {prev_status}->{STATUS_RESTORED}")
+        conn.execute("UPDATE tensors SET status=?, restored_count=restored_count+1 WHERE key=?", (STATUS_RESTORED, key))
         conn.commit()
+        self._append_manifest_event(key, STATUS_RESTORED, "")
+
+    def mark_prefetching(self, key: str):
+        self._set_status(key, STATUS_PREFETCHING)
+
+    def mark_resident(self, key: str):
+        self._set_status(key, STATUS_RESIDENT)
+
+    def mark_released(self, key: str):
+        self._set_status(key, STATUS_RELEASED)
+
+    def mark_evictable(self, key: str):
+        self._set_status(key, STATUS_EVICTABLE)
+
+    def replay_manifest(self, repair: bool = False) -> dict:
+        conn = self._conn()
+        rows = conn.execute("SELECT key, state, seq FROM manifest_events ORDER BY seq ASC").fetchall()
+        last: Dict[str, str] = {}
+        prev: Dict[str, str] = {}
+        mismatches = []
+        for k, st, seq in rows:
+            key = str(k)
+            state = str(st)
+            if state not in VALID_STATUSES:
+                mismatches.append({"key": key, "seq": int(seq), "issue": f"invalid_manifest_state:{state}"})
+                continue
+            p = prev.get(key)
+            if p is not None and (not is_valid_transition(p, state)):
+                mismatches.append({"key": key, "seq": int(seq), "issue": "illegal_manifest_transition", "from": p, "to": state})
+                if repair:
+                    conn.execute("UPDATE tensors SET status=? WHERE key=?", (STATUS_FAILED, key))
+            prev[key] = state
+            last[key] = state
+        for key, st in last.items():
+            row = conn.execute("SELECT committed,status FROM tensors WHERE key=?", (key,)).fetchone()
+            if row is None:
+                continue
+            committed, db_state = int(row[0]), str(row[1])
+            if committed != 1 and st in READABLE_STATUSES:
+                mismatches.append({"key": key, "manifest": st, "db": db_state, "issue": "manifest_readable_uncommitted"})
+                if repair:
+                    conn.execute("UPDATE tensors SET status=? WHERE key=?", (STATUS_FAILED, key))
+            elif db_state != st and st in VALID_STATUSES:
+                mismatches.append({"key": key, "manifest": st, "db": db_state, "issue": "state_drift"})
+                if repair:
+                    conn.execute("UPDATE tensors SET status=? WHERE key=?", (st, key))
+        if repair:
+            conn.commit()
+        return {"ok": len(mismatches) == 0, "count": len(mismatches), "mismatches": mismatches}
+
+    def wait_until_readable(self, key: str, timeout_s: float = 2.0, poll_s: float = 0.002) -> bool:
+        deadline = time.time() + max(0.0, float(timeout_s))
+        conn = self._conn()
+        while True:
+            row = conn.execute("SELECT committed,status FROM tensors WHERE key=?", (key,)).fetchone()
+            if row is not None:
+                committed, status = int(row[0]), str(row[1])
+                if committed == 1 and status in READABLE_STATUSES:
+                    return True
+                if status == STATUS_FAILED:
+                    return False
+            if timeout_s <= 0:
+                return False
+            if time.time() >= deadline:
+                return False
+            time.sleep(max(0.0005, float(poll_s)))
 
     def consistency_report(self, repair: bool = False) -> dict:
         conn = self._conn()
@@ -387,7 +605,7 @@ class SARCStorage:
                 if repair:
                     conn.execute("UPDATE tensors SET status=? WHERE key=?", (STATUS_FAILED, key))
                 continue
-            if int(committed) != 1 and status in (STATUS_COMMITTED, STATUS_RESTORED):
+            if int(committed) != 1 and status in READABLE_STATUSES:
                 issues.append({"key": key, "issue": f"status_without_commit:{status}"})
                 if repair:
                     conn.execute("UPDATE tensors SET status=? WHERE key=?", (STATUS_FAILED, key))
@@ -400,7 +618,10 @@ class SARCStorage:
                         conn.execute("UPDATE tensors SET status=? WHERE key=?", (STATUS_FAILED, key))
         if repair:
             conn.commit()
-        return {"ok": len(issues) == 0, "issues": issues, "count": len(issues)}
+        replay = self.replay_manifest(repair=repair)
+        if not replay.get("ok", True):
+            issues.append({"issue": "manifest_replay_mismatch", "count": int(replay.get("count", 0))})
+        return {"ok": len(issues) == 0, "issues": issues, "count": len(issues), "manifest": replay}
 
     def put_host_bytes(self, key: str, plain_blk: PinnedBlock, nbytes: int,
                        dtype_s: str, shape: Tuple[int, ...], step_id: int,
@@ -418,6 +639,7 @@ class SARCStorage:
                 min_gain_ratio=self.compression_min_gain_ratio,
             )
             stored_nbytes = len(comp_payload)
+            chunk_manifest_json = build_chunk_manifest(comp_payload)
 
             payload_bytes = (stored_nbytes + ENC_OVERHEAD) if encrypted else stored_nbytes
             padded_bytes = round_up(payload_bytes)
@@ -427,12 +649,12 @@ class SARCStorage:
             conn = self._conn()
             conn.execute("BEGIN;")
             conn.execute(
-                "INSERT OR REPLACE INTO tensors(key, step_id, pool_id, offset, nbytes, padded_bytes, dtype, shape, checksum, committed, status, encrypted, compressed, stored_nbytes, codec, restored_count, crc32) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 0, ?)",
+                "INSERT OR REPLACE INTO tensors(key, step_id, pool_id, offset, nbytes, padded_bytes, dtype, shape, checksum, committed, status, encrypted, compressed, stored_nbytes, codec, chunk_manifest, restored_count, crc32) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 0, ?)",
                 (
                     key, int(step_id), int(pool_id), int(offset), int(nbytes), int(padded_bytes),
                     dtype_s, shape_to_json(shape), checksum, STATUS_RESERVED, encrypted,
-                    int(compressed), int(stored_nbytes), codec_used, int(plain_crc),
+                    int(compressed), int(stored_nbytes), codec_used, chunk_manifest_json, int(plain_crc),
                 ),
             )
             conn.execute("COMMIT;")
@@ -450,8 +672,9 @@ class SARCStorage:
                     meta = TensorMeta(
                         key=key, step_id=step_id, pool_id=pool_id, offset=0, nbytes=nbytes,
                         padded_bytes=padded_bytes, dtype_s=dtype_s, shape=shape, sha256=checksum,
-                        encrypted=encrypted, crc32=plain_crc, status_s=STATUS_COMMITTED,
+                        encrypted=encrypted, crc32=plain_crc, status_s=STATUS_EVICTABLE,
                         compressed=int(compressed), stored_nbytes=int(stored_nbytes), codec=codec_used, restored_count=0,
+                        chunk_manifest_json=chunk_manifest_json,
                     )
                     with self._ram_lock:
                         self._ram[key] = (enc_blk, meta)
@@ -466,8 +689,9 @@ class SARCStorage:
                     meta = TensorMeta(
                         key=key, step_id=step_id, pool_id=pool_id, offset=0, nbytes=nbytes,
                         padded_bytes=padded_bytes, dtype_s=dtype_s, shape=shape, sha256=checksum,
-                        encrypted=encrypted, crc32=plain_crc, status_s=STATUS_COMMITTED,
+                        encrypted=encrypted, crc32=plain_crc, status_s=STATUS_EVICTABLE,
                         compressed=int(compressed), stored_nbytes=int(stored_nbytes), codec=codec_used, restored_count=0,
+                        chunk_manifest_json=chunk_manifest_json,
                     )
                     with self._ram_lock:
                         self._ram[key] = (ram_blk, meta)
@@ -526,6 +750,8 @@ class SARCStorage:
             # Commit metadata only after payload is written
             conn.execute("UPDATE tensors SET committed=1, status=? WHERE key=?", (STATUS_COMMITTED, key))
             conn.commit()
+            self._append_manifest_event(key, STATUS_COMMITTED, f"stored_nbytes={stored_nbytes}")
+            self._set_status(key, STATUS_EVICTABLE)
             if self.durable:
                 try:
                     dfd = os.open(os.path.dirname(self.db_path) or ".", os.O_RDONLY)
@@ -547,13 +773,15 @@ class SARCStorage:
                     codec=str(codec_used),
                     encrypted=bool(encrypted),
                     backend=self.backend,
+                    chunk_manifest=chunk_manifest_json,
                 )
 
             return TensorMeta(
                 key=key, step_id=step_id, pool_id=pool_id, offset=offset, nbytes=nbytes,
                 padded_bytes=padded_bytes, dtype_s=dtype_s, shape=shape, sha256=checksum,
-                encrypted=encrypted, crc32=plain_crc, status_s=STATUS_COMMITTED,
+                encrypted=encrypted, crc32=plain_crc, status_s=STATUS_EVICTABLE,
                 compressed=int(compressed), stored_nbytes=int(stored_nbytes), codec=codec_used, restored_count=0,
+                chunk_manifest_json=chunk_manifest_json,
             )
         finally:
             if spill_done_evt is not None:
@@ -567,16 +795,16 @@ class SARCStorage:
 
         conn = self._conn()
         row = conn.execute(
-            "SELECT step_id, pool_id, offset, nbytes, padded_bytes, dtype, shape, checksum, committed, status, encrypted, compressed, stored_nbytes, codec, restored_count, crc32 "
+            "SELECT step_id, pool_id, offset, nbytes, padded_bytes, dtype, shape, checksum, committed, status, encrypted, compressed, stored_nbytes, codec, chunk_manifest, restored_count, crc32 "
             "FROM tensors WHERE key=?",
             (key,),
         ).fetchone()
         if not row:
             raise KeyError(key)
-        step_id, pool_id, offset, nbytes, padded_bytes, dtype_s, shape_s, checksum, committed, status_s, encrypted, compressed, stored_nbytes, codec, restored_count, crc32v = row
+        step_id, pool_id, offset, nbytes, padded_bytes, dtype_s, shape_s, checksum, committed, status_s, encrypted, compressed, stored_nbytes, codec, chunk_manifest_json, restored_count, crc32v = row
         if int(committed) != 1:
             raise KeyError(f"{key} not committed")
-        if str(status_s) not in (STATUS_COMMITTED, STATUS_RESTORED):
+        if str(status_s) not in READABLE_STATUSES:
             raise KeyError(f"{key} status={status_s}")
 
         shape = shape_from_json(shape_s)
@@ -589,6 +817,7 @@ class SARCStorage:
             nbytes=int(nbytes), padded_bytes=int(padded_bytes),
             dtype_s=dtype_s, shape=shape, sha256=checksum, encrypted=int(encrypted), crc32=int(crc32v),
             status_s=str(status_s), compressed=int(compressed), stored_nbytes=int(stored_nbytes), codec=str(codec), restored_count=int(restored_count),
+            chunk_manifest_json=str(chunk_manifest_json or ""),
         )
 
     def read_block_to_pinned(self, meta: TensorMeta, dst_blk: PinnedBlock):
@@ -628,12 +857,15 @@ class SARCStorage:
         else:
             src_u8 = payload_blk.u8[:(meta.stored_nbytes or meta.nbytes)]
 
+        stored_blob = self._u8_to_bytes(src_u8, meta.stored_nbytes or meta.nbytes)
+        if not verify_chunk_manifest(stored_blob, meta.chunk_manifest_json):
+            raise RuntimeError("chunk manifest verification failed")
+
         if int(meta.compressed):
             if scratch_plain is None:
                 scratch_plain = self.acquire_pinned(meta.nbytes)
                 owns_plain = True
-            blob = self._u8_to_bytes(src_u8, meta.stored_nbytes or meta.nbytes)
-            plain = decompress_blob(blob, codec=meta.codec, expected_nbytes=meta.nbytes)
+            plain = decompress_blob(stored_blob, codec=meta.codec, expected_nbytes=meta.nbytes)
             np.copyto(scratch_plain.u8[:meta.nbytes].numpy(), np.frombuffer(plain, dtype=np.uint8))
             plain_blk = scratch_plain
         else:
