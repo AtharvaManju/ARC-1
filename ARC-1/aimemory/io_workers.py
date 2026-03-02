@@ -141,6 +141,12 @@ class IOWorkers:
             self.pool.release(popped.enc_block)
         if popped and popped.plain_block is not None:
             self.pool.release(popped.plain_block)
+        if popped and popped.work_block is not None:
+            self.pool.release(popped.work_block)
+        try:
+            self.storage.mark_restored(key)
+        except Exception:
+            pass
 
         return out
 

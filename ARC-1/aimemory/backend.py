@@ -35,3 +35,16 @@ def choose_backend(cfg_backend: str, pool_dir: str) -> str:
         return "RAM"
 
     return "NVME_FILE"
+
+
+def path_is_likely_remote(pool_dir: str) -> bool:
+    p = os.path.abspath(pool_dir or "")
+    bad_prefixes = ("/nfs", "/net", "/afs", "/mnt/nfs", "/Volumes/")
+    if p.startswith(bad_prefixes):
+        return True
+    # Heuristic: if path contains explicit network fs markers.
+    low = p.lower()
+    for k in ("nfs", "lustre", "ceph", "smb", "cifs"):
+        if f"/{k}" in low:
+            return True
+    return False

@@ -7,6 +7,8 @@ class AIMemoryConfig:
     durable: bool = False
     staging_mb: int = 512
     strict_direct: bool = False
+    compile_safe_mode: bool = True
+    strict_local_pool: bool = True
 
     spill_min_bytes: int = 128 * 1024 * 1024
     io_workers: int = 2
@@ -14,6 +16,7 @@ class AIMemoryConfig:
     queue_put_timeout_s: float = 0.01
     spill_queue_overflow_policy: str = "SYNC_SPILL"  # BLOCK | SYNC_SPILL | DISABLE_SPILLING
     pack_wait_for_commit: bool = False
+    prefetch_batch_limit: int = 8
 
     pinned_pool_bytes: int = 2 * 1024**3
     prefetch_stream_priority: int = -1
@@ -28,6 +31,12 @@ class AIMemoryConfig:
 
     encrypt_at_rest: bool = False
     encryption_key_path: str = ""
+    kms_key_uri: str = ""   # env://AIMEMORY_KEY_HEX, env://AIMEMORY_KEY_B64, file:///path/to/key
+    compression_codec: str = "none"  # none | auto | zlib | lz4 | zstd
+    compression_min_bytes: int = 4 * 1024 * 1024
+    compression_min_gain_ratio: float = 0.05
+    audit_log_path: str = ""
+    enable_audit_log: bool = False
 
     telemetry_opt_in: bool = False
     offline_mode: bool = True
@@ -58,3 +67,16 @@ class AIMemoryConfig:
 
     # NEW: perf killer toggle (default OFF)
     sync_each_step: bool = False             # if True, do torch.cuda.synchronize() each step end (debug/bench)
+
+    # Runtime autotuner
+    autotune_enabled: bool = True
+    autotune_profile_dir: str = ""
+    autotune_adjust_interval_steps: int = 10
+    model_profile_name: str = ""
+
+    # Control-plane / agent
+    control_plane_dir: str = ""
+    policy_name: str = ""
+    policy_canary_ratio: float = 1.0
+    agent_bind: str = "127.0.0.1"
+    agent_port: int = 9765

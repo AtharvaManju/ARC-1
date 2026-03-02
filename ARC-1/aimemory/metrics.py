@@ -42,6 +42,7 @@ class Metrics:
     spill_queue_overflow: int = 0
     spill_sync_fallback: int = 0
     spill_inline_pool_exhausted: int = 0
+    autotune_updates: int = 0
 
     restore_stall_ms_ema: EMA = field(default_factory=lambda: EMA(alpha=0.1))
     io_queue_depth_ema: EMA = field(default_factory=lambda: EMA(alpha=0.2))

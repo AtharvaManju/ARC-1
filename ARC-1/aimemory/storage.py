@@ -9,7 +9,8 @@ import torch
 import numpy as np
 
 from .util import ensure_dir, round_up, sha_meta, shape_to_json, shape_from_json
-from .security import load_or_create_key, encrypt_into, decrypt_to, ENC_OVERHEAD
+from .security import load_key, encrypt_into, decrypt_to, ENC_OVERHEAD, audit_log
+from .compression import compress_blob, decompress_blob, normalize_codec
 from .pinned import PinnedBlockPool, PinnedBlock
 
 try:
@@ -30,6 +31,19 @@ class TensorMeta:
     sha256: str
     encrypted: int
     crc32: int
+    status_s: str = "COMMITTED"
+    compressed: int = 0
+    stored_nbytes: int = 0
+    codec: str = "none"
+    restored_count: int = 0
+
+
+STATUS_RESERVED = "RESERVED"
+STATUS_WRITING = "WRITING"
+STATUS_COMMITTED = "COMMITTED"
+STATUS_RESTORED = "RESTORED"
+STATUS_FAILED = "FAILED"
+VALID_STATUSES = {STATUS_RESERVED, STATUS_WRITING, STATUS_COMMITTED, STATUS_RESTORED, STATUS_FAILED}
 
 def crc32_u8(u8: torch.Tensor, nbytes: int) -> int:
     arr = u8[:nbytes].contiguous().numpy()
@@ -53,7 +67,9 @@ class _EngineShim:
             except Exception:
                 pass
         try:
-            return torch.empty((n,), dtype=torch.uint8, pin_memory=True)
+            if torch.cuda.is_available():
+                return torch.empty((n,), dtype=torch.uint8, pin_memory=True)
+            return torch.empty((n,), dtype=torch.uint8)
         except Exception:
             return torch.empty((n,), dtype=torch.uint8)
 
@@ -61,6 +77,22 @@ class _EngineShim:
         if self._native is not None:
             try:
                 return bool(self._native.last_used_direct())
+            except Exception:
+                return False
+        return False
+
+    def gds_enabled(self) -> bool:
+        if self._native is not None:
+            try:
+                return bool(self._native.gds_enabled())
+            except Exception:
+                return False
+        return False
+
+    def uring_enabled(self) -> bool:
+        if self._native is not None:
+            try:
+                return bool(self._native.uring_enabled())
             except Exception:
                 return False
         return False
@@ -74,6 +106,12 @@ class SARCStorage:
         durable: bool = False,
         encrypt_at_rest: bool = False,
         key_path: str = "",
+        key_uri: str = "",
+        compression_codec: str = "none",
+        compression_min_bytes: int = 4 * 1024 * 1024,
+        compression_min_gain_ratio: float = 0.05,
+        audit_log_path: str = "",
+        enable_audit_log: bool = False,
         strict_direct: bool = False,
         backend: str = "NVME_FILE",
         pinned_pool: Optional[PinnedBlockPool] = None,
@@ -97,7 +135,13 @@ class SARCStorage:
         if self.encrypt_at_rest:
             if not key_path:
                 key_path = os.path.join(self.rank_dir, "enc.key")
-            self._key = load_or_create_key(key_path)
+            self._key = load_key(key_path=key_path, key_uri=key_uri)
+
+        self.compression_codec = normalize_codec(compression_codec)
+        self.compression_min_bytes = int(compression_min_bytes)
+        self.compression_min_gain_ratio = float(compression_min_gain_ratio)
+        self.enable_audit_log = bool(enable_audit_log)
+        self.audit_log_path = audit_log_path or os.path.join(self.rank_dir, "aimemory.audit.jsonl")
 
         self.engine = _EngineShim(staging_mb=staging_mb, strict_direct=self.strict_direct)
         self.engine_lock = threading.Lock()
@@ -166,7 +210,12 @@ class SARCStorage:
                 shape TEXT NOT NULL,
                 checksum TEXT NOT NULL,
                 committed INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'COMMITTED',
                 encrypted INTEGER NOT NULL,
+                compressed INTEGER NOT NULL DEFAULT 0,
+                stored_nbytes INTEGER NOT NULL DEFAULT 0,
+                codec TEXT NOT NULL DEFAULT 'none',
+                restored_count INTEGER NOT NULL DEFAULT 0,
                 crc32 INTEGER NOT NULL
             )
         """)
@@ -186,6 +235,18 @@ class SARCStorage:
             conn.execute("ALTER TABLE tensors ADD COLUMN step_id INTEGER NOT NULL DEFAULT 0")
         if "pool_id" not in cols:
             conn.execute("ALTER TABLE tensors ADD COLUMN pool_id INTEGER NOT NULL DEFAULT 0")
+        if "status" not in cols:
+            conn.execute("ALTER TABLE tensors ADD COLUMN status TEXT NOT NULL DEFAULT 'COMMITTED'")
+        if "compressed" not in cols:
+            conn.execute("ALTER TABLE tensors ADD COLUMN compressed INTEGER NOT NULL DEFAULT 0")
+        if "stored_nbytes" not in cols:
+            conn.execute("ALTER TABLE tensors ADD COLUMN stored_nbytes INTEGER NOT NULL DEFAULT 0")
+            conn.execute("UPDATE tensors SET stored_nbytes=nbytes WHERE stored_nbytes=0")
+        if "codec" not in cols:
+            conn.execute("ALTER TABLE tensors ADD COLUMN codec TEXT NOT NULL DEFAULT 'none'")
+        if "restored_count" not in cols:
+            conn.execute("ALTER TABLE tensors ADD COLUMN restored_count INTEGER NOT NULL DEFAULT 0")
+        conn.execute("PRAGMA user_version=2;")
         conn.commit()
         conn.close()
 
@@ -220,7 +281,8 @@ class SARCStorage:
         conn = sqlite3.connect(self.db_path, timeout=30.0, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=%s;" % ("FULL" if self.durable else "NORMAL"))
-        conn.execute("DELETE FROM tensors WHERE committed=0")
+        conn.execute("DELETE FROM tensors WHERE committed=0 OR status IN (?, ?, ?)", (STATUS_RESERVED, STATUS_WRITING, STATUS_FAILED))
+        conn.execute("UPDATE tensors SET status=? WHERE committed=1 AND status NOT IN (?, ?)", (STATUS_COMMITTED, STATUS_COMMITTED, STATUS_RESTORED))
 
         rows = conn.execute("SELECT pool_id, MAX(offset + padded_bytes) FROM tensors WHERE committed=1 GROUP BY pool_id").fetchall()
         for pool_id, max_end in rows:
@@ -235,8 +297,8 @@ class SARCStorage:
         conn.close()
 
     def mark_failed(self, key: str):
-        # Remove any uncommitted row to avoid weird mid-run states
         conn = self._conn()
+        conn.execute("UPDATE tensors SET status=? WHERE key=?", (STATUS_FAILED, key))
         conn.execute("DELETE FROM tensors WHERE key=? AND committed=0", (key,))
         conn.commit()
 
@@ -289,77 +351,159 @@ class SARCStorage:
         src_np = np.frombuffer(mv, dtype=np.uint8)
         np.copyto(dst_np, src_np)
 
+    def _u8_to_bytes(self, u8: torch.Tensor, nbytes: int) -> bytes:
+        arr = u8[:nbytes]
+        if not arr.is_contiguous():
+            arr = arr.contiguous()
+        return bytes(memoryview(arr.numpy()))
+
+    def _bytes_to_block(self, data: bytes) -> PinnedBlock:
+        blk = self.acquire_pinned(len(data))
+        if data:
+            np.copyto(blk.u8[:len(data)].numpy(), np.frombuffer(data, dtype=np.uint8))
+        return blk
+
+    def _set_status(self, key: str, status_s: str):
+        if status_s not in VALID_STATUSES:
+            raise ValueError(f"invalid status: {status_s}")
+        conn = self._conn()
+        conn.execute("UPDATE tensors SET status=? WHERE key=?", (status_s, key))
+        conn.commit()
+
+    def mark_restored(self, key: str):
+        conn = self._conn()
+        conn.execute("UPDATE tensors SET status=?, restored_count=restored_count+1 WHERE key=? AND committed=1", (STATUS_RESTORED, key))
+        conn.commit()
+
+    def consistency_report(self, repair: bool = False) -> dict:
+        conn = self._conn()
+        rows = conn.execute(
+            "SELECT key, pool_id, offset, padded_bytes, committed, status FROM tensors"
+        ).fetchall()
+        issues: list[dict] = []
+        for key, pool_id, offset, padded_bytes, committed, status in rows:
+            if status not in VALID_STATUSES:
+                issues.append({"key": key, "issue": f"invalid_status:{status}"})
+                if repair:
+                    conn.execute("UPDATE tensors SET status=? WHERE key=?", (STATUS_FAILED, key))
+                continue
+            if int(committed) != 1 and status in (STATUS_COMMITTED, STATUS_RESTORED):
+                issues.append({"key": key, "issue": f"status_without_commit:{status}"})
+                if repair:
+                    conn.execute("UPDATE tensors SET status=? WHERE key=?", (STATUS_FAILED, key))
+            if self.backend == "NVME_FILE":
+                p = self._pool_path(int(pool_id))
+                end = int(offset) + int(padded_bytes)
+                if (not os.path.exists(p)) or (os.path.getsize(p) < end):
+                    issues.append({"key": key, "issue": "pool_payload_missing_or_short"})
+                    if repair:
+                        conn.execute("UPDATE tensors SET status=? WHERE key=?", (STATUS_FAILED, key))
+        if repair:
+            conn.commit()
+        return {"ok": len(issues) == 0, "issues": issues, "count": len(issues)}
+
     def put_host_bytes(self, key: str, plain_blk: PinnedBlock, nbytes: int,
                        dtype_s: str, shape: Tuple[int, ...], step_id: int,
                        spill_done_evt=None) -> TensorMeta:
         try:
             encrypted = 1 if self.encrypt_at_rest else 0
-            payload_bytes = (nbytes + ENC_OVERHEAD) if encrypted else nbytes
-            padded_bytes = round_up(payload_bytes)
             pool_id = self._pool_id_for_step(step_id)
 
-            offset = self.alloc(pool_id, padded_bytes) if self.backend == "NVME_FILE" else 0
+            plain_crc = int(zlib.crc32(memoryview(plain_blk.u8[:nbytes].contiguous().numpy())) & 0xFFFFFFFF)
+            plain_bytes = self._u8_to_bytes(plain_blk.u8, nbytes)
+            comp_payload, codec_used, compressed = compress_blob(
+                plain_bytes,
+                codec=self.compression_codec,
+                min_bytes=self.compression_min_bytes,
+                min_gain_ratio=self.compression_min_gain_ratio,
+            )
+            stored_nbytes = len(comp_payload)
 
-            crc = 0 if encrypted else crc32_u8(plain_blk.u8, nbytes)
+            payload_bytes = (stored_nbytes + ENC_OVERHEAD) if encrypted else stored_nbytes
+            padded_bytes = round_up(payload_bytes)
+            offset = self.alloc(pool_id, padded_bytes) if self.backend == "NVME_FILE" else 0
             checksum = sha_meta(dtype_s, shape, nbytes, padded_bytes, offset, encrypted, step_id, pool_id)
 
             conn = self._conn()
-            # Single transaction: insert uncommitted
             conn.execute("BEGIN;")
             conn.execute(
-                "INSERT OR REPLACE INTO tensors(key, step_id, pool_id, offset, nbytes, padded_bytes, dtype, shape, checksum, committed, encrypted, crc32) "
-                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
-                (key, int(step_id), int(pool_id), int(offset), int(nbytes), int(padded_bytes), dtype_s, shape_to_json(shape), checksum, encrypted, int(crc)),
+                "INSERT OR REPLACE INTO tensors(key, step_id, pool_id, offset, nbytes, padded_bytes, dtype, shape, checksum, committed, status, encrypted, compressed, stored_nbytes, codec, restored_count, crc32) "
+                "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 0, ?)",
+                (
+                    key, int(step_id), int(pool_id), int(offset), int(nbytes), int(padded_bytes),
+                    dtype_s, shape_to_json(shape), checksum, STATUS_RESERVED, encrypted,
+                    int(compressed), int(stored_nbytes), codec_used, int(plain_crc),
+                ),
             )
             conn.execute("COMMIT;")
+            self._set_status(key, STATUS_WRITING)
 
             pool_path = None
             if self.backend == "RAM":
+                src_blk = self._bytes_to_block(comp_payload) if compressed else plain_blk
                 if encrypted:
                     assert self._key is not None
                     enc_blk = self.acquire_pinned(padded_bytes)
-                    blob_len = encrypt_into(enc_blk.u8, plain_blk.u8, self._key, nbytes)
+                    blob_len = encrypt_into(enc_blk.u8, src_blk.u8, self._key, stored_nbytes)
                     if padded_bytes > blob_len:
                         enc_blk.u8[blob_len:padded_bytes].zero_()
-                    meta = TensorMeta(key, step_id, pool_id, 0, nbytes, padded_bytes, dtype_s, shape, checksum, encrypted, crc)
+                    meta = TensorMeta(
+                        key=key, step_id=step_id, pool_id=pool_id, offset=0, nbytes=nbytes,
+                        padded_bytes=padded_bytes, dtype_s=dtype_s, shape=shape, sha256=checksum,
+                        encrypted=encrypted, crc32=plain_crc, status_s=STATUS_COMMITTED,
+                        compressed=int(compressed), stored_nbytes=int(stored_nbytes), codec=codec_used, restored_count=0,
+                    )
                     with self._ram_lock:
                         self._ram[key] = (enc_blk, meta)
                         self._ram_bytes += int(enc_blk.size)
+                    if compressed:
+                        self.release_pinned(src_blk)
                 else:
-                    if padded_bytes > nbytes:
-                        plain_blk.u8[nbytes:padded_bytes].zero_()
-                    meta = TensorMeta(key, step_id, pool_id, 0, nbytes, padded_bytes, dtype_s, shape, checksum, encrypted, crc)
+                    ram_blk = self.acquire_pinned(padded_bytes)
+                    ram_blk.u8[:stored_nbytes].copy_(src_blk.u8[:stored_nbytes], non_blocking=False)
+                    if padded_bytes > stored_nbytes:
+                        ram_blk.u8[stored_nbytes:padded_bytes].zero_()
+                    meta = TensorMeta(
+                        key=key, step_id=step_id, pool_id=pool_id, offset=0, nbytes=nbytes,
+                        padded_bytes=padded_bytes, dtype_s=dtype_s, shape=shape, sha256=checksum,
+                        encrypted=encrypted, crc32=plain_crc, status_s=STATUS_COMMITTED,
+                        compressed=int(compressed), stored_nbytes=int(stored_nbytes), codec=codec_used, restored_count=0,
+                    )
                     with self._ram_lock:
-                        ram_blk = self.acquire_pinned(padded_bytes)
-                        ram_blk.u8[:padded_bytes].copy_(plain_blk.u8[:padded_bytes], non_blocking=False)
                         self._ram[key] = (ram_blk, meta)
                         self._ram_bytes += int(ram_blk.size)
+                    if compressed:
+                        self.release_pinned(src_blk)
             else:
                 pool_path = self._pool_path(pool_id)
                 if not os.path.exists(pool_path):
                     open(pool_path, "ab").close()
 
-                if encrypted:
-                    assert self._key is not None
-                    enc_blk = self.acquire_pinned(padded_bytes)
-                    blob_len = encrypt_into(enc_blk.u8, plain_blk.u8, self._key, nbytes)
-                    if padded_bytes > blob_len:
-                        enc_blk.u8[blob_len:padded_bytes].zero_()
-
-                    with self.engine_lock:
-                        if self.engine._native is not None:
-                            self.engine._native.write_host_ptr_to_file(pool_path, enc_blk.u8.data_ptr(), padded_bytes, offset, self.strict_direct)
-                        else:
-                            self._python_write_tensor(pool_path, offset, enc_blk.u8, padded_bytes)
-                    self.release_pinned(enc_blk)
-                else:
-                    if padded_bytes > nbytes:
-                        plain_blk.u8[nbytes:padded_bytes].zero_()
-                    with self.engine_lock:
-                        if self.engine._native is not None:
-                            self.engine._native.write_host_ptr_to_file(pool_path, plain_blk.u8.data_ptr(), padded_bytes, offset, self.strict_direct)
-                        else:
-                            self._python_write_tensor(pool_path, offset, plain_blk.u8, padded_bytes)
+                src_blk = self._bytes_to_block(comp_payload) if compressed else plain_blk
+                try:
+                    if encrypted:
+                        assert self._key is not None
+                        enc_blk = self.acquire_pinned(padded_bytes)
+                        blob_len = encrypt_into(enc_blk.u8, src_blk.u8, self._key, stored_nbytes)
+                        if padded_bytes > blob_len:
+                            enc_blk.u8[blob_len:padded_bytes].zero_()
+                        with self.engine_lock:
+                            if self.engine._native is not None:
+                                self.engine._native.write_host_ptr_to_file(pool_path, enc_blk.u8.data_ptr(), padded_bytes, offset, self.strict_direct)
+                            else:
+                                self._python_write_tensor(pool_path, offset, enc_blk.u8, padded_bytes)
+                        self.release_pinned(enc_blk)
+                    else:
+                        if padded_bytes > stored_nbytes:
+                            src_blk.u8[stored_nbytes:padded_bytes].zero_()
+                        with self.engine_lock:
+                            if self.engine._native is not None:
+                                self.engine._native.write_host_ptr_to_file(pool_path, src_blk.u8.data_ptr(), padded_bytes, offset, self.strict_direct)
+                            else:
+                                self._python_write_tensor(pool_path, offset, src_blk.u8, padded_bytes)
+                finally:
+                    if compressed:
+                        self.release_pinned(src_blk)
 
                 if self.durable:
                     try:
@@ -380,7 +524,7 @@ class SARCStorage:
                         pass
 
             # Commit metadata only after payload is written
-            conn.execute("UPDATE tensors SET committed=1 WHERE key=?", (key,))
+            conn.execute("UPDATE tensors SET committed=1, status=? WHERE key=?", (STATUS_COMMITTED, key))
             conn.commit()
             if self.durable:
                 try:
@@ -392,7 +536,25 @@ class SARCStorage:
                 except Exception:
                     pass
 
-            return TensorMeta(key, step_id, pool_id, offset, nbytes, padded_bytes, dtype_s, shape, checksum, encrypted, crc)
+            if self.enable_audit_log:
+                audit_log(
+                    self.audit_log_path,
+                    "spill_commit",
+                    key=key,
+                    step_id=int(step_id),
+                    nbytes=int(nbytes),
+                    stored_nbytes=int(stored_nbytes),
+                    codec=str(codec_used),
+                    encrypted=bool(encrypted),
+                    backend=self.backend,
+                )
+
+            return TensorMeta(
+                key=key, step_id=step_id, pool_id=pool_id, offset=offset, nbytes=nbytes,
+                padded_bytes=padded_bytes, dtype_s=dtype_s, shape=shape, sha256=checksum,
+                encrypted=encrypted, crc32=plain_crc, status_s=STATUS_COMMITTED,
+                compressed=int(compressed), stored_nbytes=int(stored_nbytes), codec=codec_used, restored_count=0,
+            )
         finally:
             if spill_done_evt is not None:
                 spill_done_evt.set()
@@ -405,15 +567,17 @@ class SARCStorage:
 
         conn = self._conn()
         row = conn.execute(
-            "SELECT step_id, pool_id, offset, nbytes, padded_bytes, dtype, shape, checksum, committed, encrypted, crc32 "
+            "SELECT step_id, pool_id, offset, nbytes, padded_bytes, dtype, shape, checksum, committed, status, encrypted, compressed, stored_nbytes, codec, restored_count, crc32 "
             "FROM tensors WHERE key=?",
             (key,),
         ).fetchone()
         if not row:
             raise KeyError(key)
-        step_id, pool_id, offset, nbytes, padded_bytes, dtype_s, shape_s, checksum, committed, encrypted, crc32v = row
+        step_id, pool_id, offset, nbytes, padded_bytes, dtype_s, shape_s, checksum, committed, status_s, encrypted, compressed, stored_nbytes, codec, restored_count, crc32v = row
         if int(committed) != 1:
             raise KeyError(f"{key} not committed")
+        if str(status_s) not in (STATUS_COMMITTED, STATUS_RESTORED):
+            raise KeyError(f"{key} status={status_s}")
 
         shape = shape_from_json(shape_s)
         expected = sha_meta(dtype_s, shape, int(nbytes), int(padded_bytes), int(offset), int(encrypted), int(step_id), int(pool_id))
@@ -423,7 +587,8 @@ class SARCStorage:
         return TensorMeta(
             key=key, step_id=int(step_id), pool_id=int(pool_id), offset=int(offset),
             nbytes=int(nbytes), padded_bytes=int(padded_bytes),
-            dtype_s=dtype_s, shape=shape, sha256=checksum, encrypted=int(encrypted), crc32=int(crc32v)
+            dtype_s=dtype_s, shape=shape, sha256=checksum, encrypted=int(encrypted), crc32=int(crc32v),
+            status_s=str(status_s), compressed=int(compressed), stored_nbytes=int(stored_nbytes), codec=str(codec), restored_count=int(restored_count),
         )
 
     def read_block_to_pinned(self, meta: TensorMeta, dst_blk: PinnedBlock):
@@ -440,23 +605,59 @@ class SARCStorage:
             else:
                 self._python_read_into_tensor(pool_path, meta.offset, dst_blk.u8, meta.padded_bytes)
 
-    def restore_to_cuda_from_pinned(self, meta: TensorMeta, enc_blk: PinnedBlock, out: torch.Tensor, scratch_plain: Optional[PinnedBlock] = None):
-        if meta.encrypted:
-            assert self._key is not None
-            plain_blk = scratch_plain if scratch_plain is not None else self.acquire_pinned(meta.nbytes)
-            decrypt_to(plain_blk.u8, enc_blk.u8, self._key, meta.nbytes)
-            src_u8 = plain_blk.u8[:meta.nbytes].view(torch.uint8).reshape(-1)
-        else:
-            got = crc32_u8(enc_blk.u8, meta.nbytes)
-            if got != meta.crc32:
-                raise RuntimeError("CRC32 mismatch: data corruption detected")
-            src_u8 = enc_blk.u8[:meta.nbytes].view(torch.uint8).reshape(-1)
+    def decode_to_plain_block(
+        self,
+        meta: TensorMeta,
+        payload_blk: PinnedBlock,
+        scratch_plain: Optional[PinnedBlock] = None,
+        scratch_work: Optional[PinnedBlock] = None,
+    ) -> Tuple[PinnedBlock, Optional[PinnedBlock], bool, bool]:
+        """
+        Returns: (plain_blk, owns_plain, owns_work)
+        """
+        owns_plain = False
+        owns_work = False
 
+        if int(meta.encrypted):
+            assert self._key is not None
+            if scratch_work is None:
+                scratch_work = self.acquire_pinned(meta.stored_nbytes or meta.nbytes)
+                owns_work = True
+            decrypt_to(scratch_work.u8, payload_blk.u8, self._key, meta.stored_nbytes or meta.nbytes)
+            src_u8 = scratch_work.u8[:(meta.stored_nbytes or meta.nbytes)]
+        else:
+            src_u8 = payload_blk.u8[:(meta.stored_nbytes or meta.nbytes)]
+
+        if int(meta.compressed):
+            if scratch_plain is None:
+                scratch_plain = self.acquire_pinned(meta.nbytes)
+                owns_plain = True
+            blob = self._u8_to_bytes(src_u8, meta.stored_nbytes or meta.nbytes)
+            plain = decompress_blob(blob, codec=meta.codec, expected_nbytes=meta.nbytes)
+            np.copyto(scratch_plain.u8[:meta.nbytes].numpy(), np.frombuffer(plain, dtype=np.uint8))
+            plain_blk = scratch_plain
+        else:
+            if scratch_plain is None:
+                scratch_plain = self.acquire_pinned(meta.nbytes)
+                owns_plain = True
+            scratch_plain.u8[:meta.nbytes].copy_(src_u8[:meta.nbytes], non_blocking=False)
+            plain_blk = scratch_plain
+
+        got = crc32_u8(plain_blk.u8, meta.nbytes)
+        if got != meta.crc32:
+            raise RuntimeError("CRC32 mismatch: data corruption detected")
+        return plain_blk, scratch_work, owns_plain, owns_work
+
+    def restore_to_cuda_from_pinned(self, meta: TensorMeta, enc_blk: PinnedBlock, out: torch.Tensor, scratch_plain: Optional[PinnedBlock] = None):
+        plain_blk, work_blk, owns_plain, owns_work = self.decode_to_plain_block(meta, enc_blk, scratch_plain=scratch_plain, scratch_work=None)
+        src_u8 = plain_blk.u8[:meta.nbytes].view(torch.uint8).reshape(-1)
         out_u8 = out.view(torch.uint8).reshape(-1)
         out_u8.copy_(src_u8, non_blocking=True)
-
-        if meta.encrypted and scratch_plain is None:
+        self.mark_restored(meta.key)
+        if owns_plain:
             self.release_pinned(plain_blk)
+        if owns_work and work_blk is not None:
+            self.release_pinned(work_blk)
 
     def ram_gc_keep_last_windows(self, keep_last_windows: int, current_pool_id: int):
         if self.backend != "RAM":

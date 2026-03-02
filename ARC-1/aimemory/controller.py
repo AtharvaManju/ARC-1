@@ -1,5 +1,7 @@
 import time
 import threading
+import os
+import json
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
@@ -14,9 +16,11 @@ from .io_workers import IOWorkers, SpillHostJob, PrefetchJob
 from .util import dtype_to_str, str_to_dtype, round_up
 from .license import verify_license
 from .telemetry import emit_telemetry
-from .backend import detect_distributed, choose_backend
+from .backend import detect_distributed, choose_backend, path_is_likely_remote
 from .logging_jsonl import JsonlLogger, default_rank_log_path, safe_exc
 from .gc import gc_windows_if_needed
+from .autotune import RuntimeAutoTuner
+from .control_plane import PolicyStore
 
 @dataclass
 class PackedRef:
@@ -38,6 +42,18 @@ class AIMemoryController:
 
         if cfg.warn_on_multinode and is_multinode:
             print("[aimemory] WARNING: multi-node detected. Use per-node local pool_dir. Shared FS not supported.")
+        if is_multinode and bool(getattr(cfg, "strict_local_pool", True)) and path_is_likely_remote(cfg.pool_dir):
+            raise RuntimeError(f"pool_dir appears non-local for multi-node setup: {cfg.pool_dir}")
+
+        cp_dir = str(getattr(cfg, "control_plane_dir", "") or os.path.join(cfg.pool_dir, "control_plane"))
+        self._policy_store = PolicyStore(cp_dir)
+        if str(getattr(cfg, "policy_name", "")):
+            ratio = max(0.0, min(float(getattr(cfg, "policy_canary_ratio", 1.0)), 1.0))
+            apply_pol = (ratio >= 1.0) or ((self.rank % 1000) < int(ratio * 1000))
+            if apply_pol:
+                pol = self._policy_store.pull(str(cfg.policy_name))
+                if pol:
+                    self._policy_store.apply_to_config(cfg, pol)
 
         if cfg.require_license:
             st = verify_license(cfg.license_path)
@@ -72,6 +88,12 @@ class AIMemoryController:
                 durable=cfg.durable,
                 encrypt_at_rest=cfg.encrypt_at_rest,
                 key_path=cfg.encryption_key_path,
+                key_uri=cfg.kms_key_uri,
+                compression_codec=cfg.compression_codec,
+                compression_min_bytes=cfg.compression_min_bytes,
+                compression_min_gain_ratio=cfg.compression_min_gain_ratio,
+                audit_log_path=cfg.audit_log_path,
+                enable_audit_log=cfg.enable_audit_log,
                 strict_direct=cfg.strict_direct,
                 backend=("RAM" if self.backend == "RAM" else "NVME_FILE"),
                 pinned_pool=None,
@@ -100,6 +122,8 @@ class AIMemoryController:
         self._step_start_evt: Optional[torch.cuda.Event] = None
         self._step_end_evt: Optional[torch.cuda.Event] = None
         self._step_spills_start: int = 0
+        self._agent_metrics_path = os.path.join(cfg.pool_dir, f"rank_{self.rank}", "agent_metrics.json")
+        self._autotuner = RuntimeAutoTuner(cfg, self.metrics)
 
         if self._logger:
             self._logger.log({"evt": "init", "rank": self.rank, "world": self.world_size, "backend": self.backend})
@@ -149,13 +173,26 @@ class AIMemoryController:
             "spill_queue_overflow": m.spill_queue_overflow,
             "spill_sync_fallback": m.spill_sync_fallback,
             "spill_inline_pool_exhausted": m.spill_inline_pool_exhausted,
+            "autotune_updates": m.autotune_updates,
             "prefetch_hit_rate": m.prefetch_hit_rate(),
             "safe_mode": m.safe_mode,
             "disable_reason": m.disable_reason,
             "pcc_enabled": m.pcc_enabled,
             "pcc_drift_count": m.pcc_drift_count,
             "queue_depth": (self.io.queue_depth() if self.io else 0),
+            "spill_min_bytes": int(self.cfg.spill_min_bytes),
+            "pcc_lookahead": int(self.cfg.pcc_lookahead),
+            "engine_native": bool((self.storage is not None) and (self.storage.engine._native is not None)),
+            "engine_gds": bool((self.storage is not None) and self.storage.engine.gds_enabled()),
+            "engine_uring": bool((self.storage is not None) and self.storage.engine.uring_enabled()),
         }
+
+    def _is_compiling(self) -> bool:
+        try:
+            import torch._dynamo as dynamo  # type: ignore
+            return bool(dynamo.is_compiling())
+        except Exception:
+            return False
 
     def _new_key(self, pack_idx: int) -> str:
         return f"r{self.rank}_s{self._step_id}_p{pack_idx}_{int(time.time()*1e6)}"
@@ -189,12 +226,16 @@ class AIMemoryController:
     def _submit_lookahead_prefetch(self):
         if not self.pcc.enabled or self.pcc.mode != "EXECUTION":
             return
-        for pidx in self.pcc.next_prefetch_pack_indices():
+        lim = max(1, int(getattr(self.cfg, "prefetch_batch_limit", 8)))
+        for pidx in self.pcc.next_prefetch_pack_indices()[:lim]:
             self._maybe_submit_prefetch_for_pack(int(pidx))
 
     def _pack_hook(self, t: torch.Tensor) -> PackedRef:
         self._pack_counter += 1
         pack_idx = self._pack_counter
+
+        if bool(getattr(self.cfg, "compile_safe_mode", True)) and self._is_compiling():
+            return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
 
         if self._noop or (not t.is_cuda):
             return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
@@ -445,6 +486,8 @@ class AIMemoryController:
 
                 c.policy.enforce_sla(c._step_id, dt_ms)
                 c.policy.maybe_reenable(c._step_id)
+                c._autotuner.observe_step(c._step_id)
+                c.pcc.lookahead = int(c.cfg.pcc_lookahead)
 
                 emit_telemetry(
                     {
@@ -467,6 +510,12 @@ class AIMemoryController:
 
                 if c._logger:
                     c._logger.log({"evt": "step_end", "step": c._step_id, "dt_ms": dt_ms, "backend": c.backend})
+                try:
+                    os.makedirs(os.path.dirname(c._agent_metrics_path) or ".", exist_ok=True)
+                    with open(c._agent_metrics_path, "w") as f:
+                        json.dump(c.metrics_snapshot(), f, indent=2)
+                except Exception:
+                    pass
 
                 # Deterministic retention GC (periodic + emergency budget)
                 try:

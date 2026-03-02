@@ -3,10 +3,9 @@ from dataclasses import dataclass
 from typing import Dict, Optional
 
 import torch
-from .storage import TensorMeta, crc32_u8
+from .storage import TensorMeta
 from .pinned import PinnedBlock
 from .util import str_to_dtype
-from .security import decrypt_to
 
 @dataclass
 class PrefetchResult:
@@ -15,6 +14,7 @@ class PrefetchResult:
     cuda_event: Optional[torch.cuda.Event]
     enc_block: Optional[PinnedBlock]
     plain_block: Optional[PinnedBlock]
+    work_block: Optional[PinnedBlock]
 
 class OverlapPipeline:
     def __init__(self, storage, pool, stream_priority: int = -1):
@@ -28,7 +28,7 @@ class OverlapPipeline:
         with self._lock:
             if key in self._inflight:
                 return False
-            self._inflight[key] = PrefetchResult(None, threading.Event(), None, None, None)
+            self._inflight[key] = PrefetchResult(None, threading.Event(), None, None, None, None)
             return True
 
     def get(self, key: str) -> Optional[PrefetchResult]:
@@ -50,23 +50,15 @@ class OverlapPipeline:
             return
 
         plain_blk = None
+        work_blk = None
         try:
             self.storage.read_block_to_pinned(meta, enc_blk)
-
-            if meta.encrypted:
-                plain_blk = self.pool.acquire(meta.nbytes)
-                if plain_blk is None:
-                    pr.ready.set()
-                    self.pool.release(enc_blk)
-                    return
-                assert self.storage._key is not None
-                decrypt_to(plain_blk.u8, enc_blk.u8, self.storage._key, meta.nbytes)
-                src_u8 = plain_blk.u8[:meta.nbytes]
-            else:
-                got = crc32_u8(enc_blk.u8, meta.nbytes)
-                if got != meta.crc32:
-                    raise RuntimeError("CRC32 mismatch during prefetch")
-                src_u8 = enc_blk.u8[:meta.nbytes]
+            plain_blk, work_blk, owns_plain, owns_work = self.storage.decode_to_plain_block(meta, enc_blk, scratch_plain=None, scratch_work=None)
+            if not owns_plain:
+                plain_blk = None
+            if not owns_work:
+                work_blk = None
+            src_u8 = plain_blk.u8[:meta.nbytes] if plain_blk is not None else enc_blk.u8[:meta.nbytes]
 
             dt = str_to_dtype(meta.dtype_s)
             out = torch.empty(meta.shape, device="cuda", dtype=dt)
@@ -83,6 +75,7 @@ class OverlapPipeline:
             pr.cuda_event = evt
             pr.enc_block = enc_blk
             pr.plain_block = plain_blk
+            pr.work_block = work_blk
             pr.ready.set()
 
         except Exception:
@@ -90,4 +83,6 @@ class OverlapPipeline:
             self.pool.release(enc_blk)
             if plain_blk is not None:
                 self.pool.release(plain_blk)
+            if work_blk is not None:
+                self.pool.release(work_blk)
             raise

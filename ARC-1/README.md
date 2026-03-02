@@ -54,3 +54,8 @@ for _ in range(1000):
 - `aimemory gc`
 - `aimemory support-bundle --out bundle.zip`
 - `aimemory headroom-gate --pool-dir /mnt/nvme_pool --out ./aimemory_headroom_gate.json`
+- `aimemory qualify --pool-dir /mnt/nvme_pool --out ./aimemory_qualification.json`
+- `aimemory consistency-check --pool-dir /mnt/nvme_pool --rank 0`
+- `aimemory policy-push --pool-dir /mnt/nvme_pool --name prod --file policy.json`
+- `aimemory fleet-report --pool-dir /mnt/nvme_pool`
+- `aimemory agent --bind 0.0.0.0 --port 9765`

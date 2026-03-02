@@ -1,1 +1,3 @@
 __version__ = "0.10.2"
+API_SCHEMA_VERSION = 2
+DB_SCHEMA_VERSION = 2

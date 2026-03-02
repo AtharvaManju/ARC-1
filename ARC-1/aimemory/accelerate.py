@@ -8,3 +8,8 @@ def wrap_accelerate_backward(ctrl, profiling_warmup: bool = False):
         yield
     finally:
         ctx.__exit__(None, None, None)
+        if profiling_warmup:
+            try:
+                ctrl.finalize_pcc_profile()
+            except Exception:
+                pass
