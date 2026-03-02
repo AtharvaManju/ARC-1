@@ -28,7 +28,7 @@ def build_support_bundle(pool_dir: str, out_zip: str, rank: int = 0, namespace: 
             rank_dir = os.path.join(pool_dir, f"ns_{ns}", f"rank_{rank}")
         else:
             rank_dir = os.path.join(pool_dir, f"rank_{rank}")
-        for fn in ["aimemory.log.jsonl", "metadata.db", "agent_metrics.json", "aimemory.audit.jsonl"]:
+        for fn in ["aimemory.log.jsonl", "metadata.db", "agent_metrics.json", "aimemory.audit.jsonl", "memory_trace.json"]:
             p = os.path.join(rank_dir, fn)
             if os.path.exists(p):
                 z.write(p, arcname=f"rank_{rank}/{fn}")

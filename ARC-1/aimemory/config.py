@@ -164,6 +164,7 @@ class AIMemoryConfig:
     policy_auto_rollback_enabled: bool = True
     policy_rollback_p99_ms: float = 0.0
     policy_rollback_safe_mode_max: int = 0
+    policy_model_dir: str = ""
     agent_bind: str = "127.0.0.1"
     agent_port: int = 9765
     agent_heartbeat_interval_s: float = 5.0
@@ -172,3 +173,33 @@ class AIMemoryConfig:
     workload_id: str = ""
     workload_identity_file: str = ""
     roi_dir: str = ""
+
+    # Memory SLO contract
+    memory_slo_contract_path: str = ""
+    memory_slo_proof_dir: str = ""
+    memory_slo_policy: str = "balanced"  # balanced | throughput | max_headroom
+    memory_slo_never_oom: bool = False
+    memory_slo_max_hbm_bytes: int = 0
+    memory_slo_p99_overhead_ms: float = 0.0
+    memory_slo_p99_overhead_pct: float = 0.0
+
+    # Hybrid spill/recompute coordination
+    hybrid_memory_optimizer_enabled: bool = True
+    hybrid_io_tail_threshold_ms: float = 25.0
+    hybrid_compute_headroom_pct: float = 12.0
+    hybrid_recompute_bias: float = 0.5
+
+    # Fast-path selection
+    gds_fast_path_enabled: bool = True
+    direct_restore_enabled: bool = True
+    decompress_mode: str = "auto"  # auto | cpu | gpu
+    gpu_decompress_min_bytes: int = 8 * 1024 * 1024
+
+    # KV multi-tenant QoS
+    kv_request_budget_ratio: float = 0.20
+    kv_overload_drop_prefetch: bool = True
+
+    # Memory trace tooling
+    memory_trace_enabled: bool = True
+    memory_trace_max_events: int = 20000
+    memory_trace_out_path: str = ""

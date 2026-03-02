@@ -18,6 +18,7 @@ from .compression import compress_blob, decompress_blob, normalize_codec
 from .pinned import PinnedBlockPool, PinnedBlock
 from .fault_injection import get_fault_injector
 from .version import DB_SCHEMA_VERSION, MIN_COMPAT_DB_SCHEMA_VERSION, MANIFEST_SCHEMA_VERSION
+from .fastpath import choose_decompress_path, can_direct_restore
 
 try:
     from aimemory_engine import SARCCore  # type: ignore
@@ -218,6 +219,9 @@ class SARCStorage:
         ram_max_bytes: int = 64 * 1024**3,
         tenant_namespace: str = "default",
         disk_quota_bytes: int = 0,
+        decompress_mode: str = "auto",
+        gpu_decompress_min_bytes: int = 8 * 1024 * 1024,
+        direct_restore_enabled: bool = True,
     ):
         ns = str(tenant_namespace or "default").strip().replace("/", "_").replace("..", "_")
         if ns and ns not in ("default", "shared"):
@@ -236,6 +240,10 @@ class SARCStorage:
         self.pool_window_steps = max(1, int(pool_window_steps))
         self.ram_max_bytes = int(ram_max_bytes)
         self.disk_quota_bytes = int(max(0, disk_quota_bytes))
+        self.decompress_mode = str(decompress_mode or "auto")
+        self.gpu_decompress_min_bytes = int(max(1, gpu_decompress_min_bytes))
+        self.direct_restore_enabled = bool(direct_restore_enabled)
+        self.last_decompress_path = "none"
 
         self.encrypt_at_rest = bool(encrypt_at_rest)
         self._key: Optional[bytes] = None
@@ -1038,10 +1046,20 @@ class SARCStorage:
             if scratch_plain is None:
                 scratch_plain = self.acquire_pinned(meta.nbytes)
                 owns_plain = True
+            path = choose_decompress_path(
+                codec=str(meta.codec),
+                nbytes=int(meta.nbytes),
+                mode=self.decompress_mode,
+                gpu_available=bool(torch.cuda.is_available()),
+                gpu_min_bytes=int(self.gpu_decompress_min_bytes),
+            )
+            self.last_decompress_path = str(path)
+            # Placeholder for GPU decompress path when nvCOMP-like runtime is available.
             plain = decompress_blob(stored_blob, codec=meta.codec, expected_nbytes=meta.nbytes)
             np.copyto(scratch_plain.u8[:meta.nbytes].numpy(), np.frombuffer(plain, dtype=np.uint8))
             plain_blk = scratch_plain
         else:
+            self.last_decompress_path = "none"
             if scratch_plain is None:
                 scratch_plain = self.acquire_pinned(meta.nbytes)
                 owns_plain = True
@@ -1056,6 +1074,35 @@ class SARCStorage:
                 pass
             raise RuntimeError("CRC32 mismatch: data corruption detected")
         return plain_blk, scratch_work, owns_plain, owns_work
+
+    def try_restore_direct_to_cuda(self, meta: TensorMeta, out: torch.Tensor) -> bool:
+        if self.backend != "NVME_FILE":
+            return False
+        if out.device.type != "cuda":
+            return False
+        md = {"encrypted": int(meta.encrypted), "compressed": int(meta.compressed)}
+        if not can_direct_restore(
+            md,
+            gds_enabled=bool(self.engine.gds_enabled()),
+            direct_restore_enabled=bool(self.direct_restore_enabled),
+        ):
+            return False
+        native = self.engine._native
+        if native is None:
+            return False
+        if not hasattr(native, "gds_read_to_dev"):
+            return False
+        pool_path = self._pool_path(meta.pool_id)
+        out_u8 = out.view(torch.uint8).reshape(-1)
+        try:
+            try:
+                native.gds_read_to_dev(pool_path, out_u8.data_ptr(), int(meta.nbytes), int(meta.offset))
+            except TypeError:
+                native.gds_read_to_dev(pool_path, out_u8.data_ptr(), int(meta.nbytes), int(meta.offset), bool(self.strict_direct))
+            self.mark_restored(meta.key)
+            return True
+        except Exception:
+            return False
 
     def restore_to_cuda_from_pinned(self, meta: TensorMeta, enc_blk: PinnedBlock, out: torch.Tensor, scratch_plain: Optional[PinnedBlock] = None):
         plain_blk, work_blk, owns_plain, owns_work = self.decode_to_plain_block(meta, enc_blk, scratch_plain=scratch_plain, scratch_work=None)

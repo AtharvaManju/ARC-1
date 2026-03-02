@@ -40,15 +40,19 @@ class KVResidencyManager:
         self.eviction_policy = str(getattr(cfg, "kv_eviction_policy", "LRU")).upper()
         self.tenant_fair = bool(getattr(cfg, "kv_tenant_fairness", True))
         self.tenant_budget_ratio = float(getattr(cfg, "kv_tenant_budget_ratio", 0.25))
+        self.request_budget_ratio = float(getattr(cfg, "kv_request_budget_ratio", 0.20))
+        self.overload_drop_prefetch = bool(getattr(cfg, "kv_overload_drop_prefetch", True))
 
         self._blocks: Dict[str, KVBlock] = {}
         self._resident_bytes = 0
         self._tenant_bytes: Dict[str, int] = {}
+        self._request_bytes: Dict[str, int] = {}
         self._lru = collections.OrderedDict()
         self._clock = collections.deque()
         self._spills = 0
         self._restores = 0
         self._token_latency_ms: List[float] = []
+        self._qos_denials = 0
 
     def set_phase(self, phase: str):
         p = str(phase).lower()
@@ -69,6 +73,11 @@ class KVResidencyManager:
         if not self.tenant_fair:
             return self.budget
         return max(1, int(self.budget * self.tenant_budget_ratio))
+
+    def _request_budget(self, request_id: str) -> int:
+        if not request_id:
+            return self.budget
+        return max(1, int(self.budget * self.request_budget_ratio))
 
     def _clock_pick(self, exclude_key: Optional[str] = None) -> Optional[str]:
         if not self._clock:
@@ -140,6 +149,8 @@ class KVResidencyManager:
         blk.store_key = s_key
         self._resident_bytes -= int(blk.nbytes)
         self._tenant_bytes[blk.tenant_id] = max(0, int(self._tenant_bytes.get(blk.tenant_id, 0)) - int(blk.nbytes))
+        if blk.request_id:
+            self._request_bytes[blk.request_id] = max(0, int(self._request_bytes.get(blk.request_id, 0)) - int(blk.nbytes))
         try:
             delattr(blk, "_tensor")
         except Exception:
@@ -165,8 +176,16 @@ class KVResidencyManager:
 
     def register(self, key: str, tensor: torch.Tensor, tenant_id: str = "default", request_id: str = ""):
         if not self.enabled:
-            return
+            return False
         nbytes = int(tensor.numel() * tensor.element_size())
+        rid = str(request_id or "").strip()
+        if rid:
+            rb = self._request_budget(rid)
+            cur_req = int(self._request_bytes.get(rid, 0))
+            if cur_req + nbytes > rb:
+                self._qos_denials += 1
+                # Under per-request overload, deny growth to protect decode tail latency.
+                return False
         if key in self._blocks:
             self.release(key)
         b = KVBlock(
@@ -176,7 +195,7 @@ class KVResidencyManager:
             nbytes=nbytes,
             phase=self.phase,
             tenant_id=str(tenant_id),
-            request_id=str(request_id),
+            request_id=rid,
             last_access_ts=time.time(),
             resident=True,
             store_key="",
@@ -186,9 +205,12 @@ class KVResidencyManager:
         self._blocks[key] = b
         self._resident_bytes += nbytes
         self._tenant_bytes[b.tenant_id] = int(self._tenant_bytes.get(b.tenant_id, 0)) + nbytes
+        if rid:
+            self._request_bytes[rid] = int(self._request_bytes.get(rid, 0)) + nbytes
         self._touch(key)
         self._clock.append(key)
         self._ensure_budget()
+        return True
 
     def get(self, key: str, token_latency_ms: Optional[float] = None) -> Optional[torch.Tensor]:
         if not self.enabled:
@@ -217,6 +239,8 @@ class KVResidencyManager:
         setattr(b, "_tensor", out.view(*b.shape))
         self._resident_bytes += int(b.nbytes)
         self._tenant_bytes[b.tenant_id] = int(self._tenant_bytes.get(b.tenant_id, 0)) + int(b.nbytes)
+        if b.request_id:
+            self._request_bytes[b.request_id] = int(self._request_bytes.get(b.request_id, 0)) + int(b.nbytes)
         self._touch(key)
         self._restores += 1
         self._ensure_budget(exclude_key=key)
@@ -229,6 +253,8 @@ class KVResidencyManager:
         if (not self.enabled) or self.phase != "decode":
             return
         lookahead = max(1, int(self.decode_lookahead))
+        if self.overload_drop_prefetch and self._token_latency_p(99) > self.latency_slo_ms:
+            lookahead = 1
         for k in list(next_keys)[:lookahead]:
             b = self._blocks.get(k)
             if b is None or b.resident:
@@ -242,6 +268,8 @@ class KVResidencyManager:
         if b.resident:
             self._resident_bytes -= int(b.nbytes)
             self._tenant_bytes[b.tenant_id] = max(0, int(self._tenant_bytes.get(b.tenant_id, 0)) - int(b.nbytes))
+            if b.request_id:
+                self._request_bytes[b.request_id] = max(0, int(self._request_bytes.get(b.request_id, 0)) - int(b.nbytes))
         self._lru.pop(key, None)
 
     def _token_latency_p(self, p: float) -> float:
@@ -263,6 +291,9 @@ class KVResidencyManager:
             "spills": int(self._spills),
             "restores": int(self._restores),
             "tenant_bytes": {str(k): int(v) for k, v in self._tenant_bytes.items()},
+            "request_bytes": {str(k): int(v) for k, v in self._request_bytes.items()},
+            "qos_denials": int(self._qos_denials),
+            "overload_drop_prefetch": bool(self.overload_drop_prefetch),
             "prefetch_lookahead": int(self.prefill_lookahead if self.phase == "prefill" else self.decode_lookahead),
             "token_latency_p95_ms": self._token_latency_p(95),
             "token_latency_p99_ms": self._token_latency_p(99),

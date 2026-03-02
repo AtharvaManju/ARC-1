@@ -17,6 +17,10 @@ from aimemory.backend import detect_backend_capabilities, benchmark_path, recomm
 from aimemory.roi import ROITracker, WorkloadIdentity
 from aimemory.security import enforce_retention
 from aimemory.storage import SARCStorage
+from aimemory.memory_slo import MemorySLOContract, MemorySLOEnforcer, load_contract
+from aimemory.admission import AdmissionController, JobRequest, load_node_profiles
+from aimemory.parity_cert import certify_from_files
+from aimemory.policy_model import MemoryPolicyModel
 
 def main():
     p = argparse.ArgumentParser(prog="aimemory")
@@ -141,6 +145,46 @@ def main():
     sc = sub.add_parser("schema-compat")
     sc.add_argument("--pool-dir", default="/mnt/nvme_pool")
     sc.add_argument("--rank", type=int, default=0)
+
+    ms = sub.add_parser("memory-slo-check")
+    ms.add_argument("--contract", default="")
+    ms.add_argument("--snapshot-file", required=True)
+    ms.add_argument("--out-dir", default="./aimemory_slo_proof")
+    ms.add_argument("--rank", type=int, default=0)
+
+    ac = sub.add_parser("admission-check")
+    ac.add_argument("--job-file", required=True)
+    ac.add_argument("--nodes-file", required=True)
+    ac.add_argument("--policy-model-dir", default="")
+
+    pc = sub.add_parser("parity-certify")
+    pc.add_argument("--baseline", required=True)
+    pc.add_argument("--candidate", required=True)
+    pc.add_argument("--out", default="")
+
+    pma = sub.add_parser("policy-model-add")
+    pma.add_argument("--model-dir", default="./aimemory_policy_model")
+    pma.add_argument("--features-file", required=True)
+    pma.add_argument("--policy-file", required=True)
+    pma.add_argument("--score", type=float, default=0.0)
+
+    pmp = sub.add_parser("policy-model-predict")
+    pmp.add_argument("--model-dir", default="./aimemory_policy_model")
+    pmp.add_argument("--features-file", required=True)
+
+    pmx = sub.add_parser("policy-model-export")
+    pmx.add_argument("--model-dir", default="./aimemory_policy_model")
+    pmx.add_argument("--out", required=True)
+    pmx.add_argument("--key-uri", default="")
+
+    pmi = sub.add_parser("policy-model-import")
+    pmi.add_argument("--model-dir", default="./aimemory_policy_model")
+    pmi.add_argument("--in-file", required=True)
+    pmi.add_argument("--key-uri", default="")
+    pmi.add_argument("--require-signature", action="store_true")
+
+    tr = sub.add_parser("trace-report")
+    tr.add_argument("--trace-file", required=True)
 
     spc = sub.add_parser("static-plan-compile")
     spc.add_argument("--pool-dir", default="/mnt/nvme_pool")
@@ -316,6 +360,75 @@ def main():
         finally:
             st.close()
         print(json.dumps(rep, indent=2))
+        return 0
+    if args.cmd == "memory-slo-check":
+        with open(args.snapshot_file, "r") as f:
+            snap = json.load(f)
+        fallback = MemorySLOContract()
+        c = load_contract(args.contract, fallback=fallback)
+        e = MemorySLOEnforcer(contract=c, out_dir=args.out_dir, rank=int(args.rank))
+        rep = e.emit_proof(snap)
+        print(json.dumps(rep, indent=2))
+        return 0
+    if args.cmd == "admission-check":
+        with open(args.job_file, "r") as f:
+            j = json.load(f)
+        nodes = load_node_profiles(args.nodes_file)
+        model = MemoryPolicyModel(args.policy_model_dir) if args.policy_model_dir else None
+        adm = AdmissionController(policy_predictor=model)
+        req = JobRequest(
+            job_id=str(j.get("job_id", "job")),
+            model_fingerprint=str(j.get("model_fingerprint", "")),
+            requested_hbm_bytes=int(j.get("requested_hbm_bytes", 0)),
+            batch_size=int(j.get("batch_size", 1)),
+            seq_len=int(j.get("seq_len", 0)),
+            world_size=int(j.get("world_size", 1)),
+            policy=str(j.get("policy", "balanced")),
+            never_oom=bool(j.get("never_oom", False)),
+            max_hbm_bytes=int(j.get("max_hbm_bytes", 0)),
+            p99_overhead_ms=float(j.get("p99_overhead_ms", 0.0)),
+            p99_overhead_pct=float(j.get("p99_overhead_pct", 0.0)),
+        )
+        rep = adm.admit_many(req, nodes)
+        print(json.dumps(rep, indent=2))
+        return 0
+    if args.cmd == "parity-certify":
+        rep = certify_from_files(args.baseline, args.candidate)
+        if args.out:
+            with open(args.out, "w") as f:
+                json.dump(rep, f, indent=2)
+        print(json.dumps(rep, indent=2))
+        return 0
+    if args.cmd == "policy-model-add":
+        with open(args.features_file, "r") as f:
+            feat = json.load(f)
+        with open(args.policy_file, "r") as f:
+            pol = json.load(f)
+        pm = MemoryPolicyModel(args.model_dir)
+        pm.add_sample(feat, pol, score=float(args.score))
+        print(json.dumps({"ok": True, "samples": len(pm.samples)}, indent=2))
+        return 0
+    if args.cmd == "policy-model-predict":
+        with open(args.features_file, "r") as f:
+            feat = json.load(f)
+        pm = MemoryPolicyModel(args.model_dir)
+        rep = pm.predict(feat)
+        print(json.dumps(rep or {}, indent=2))
+        return 0
+    if args.cmd == "policy-model-export":
+        pm = MemoryPolicyModel(args.model_dir)
+        pth = pm.export_signed_pack(args.out, key_uri=str(args.key_uri))
+        print(json.dumps({"path": pth, "samples": len(pm.samples)}, indent=2))
+        return 0
+    if args.cmd == "policy-model-import":
+        pm = MemoryPolicyModel(args.model_dir)
+        rep = pm.import_signed_pack(args.in_file, key_uri=str(args.key_uri), require_signature=bool(args.require_signature))
+        print(json.dumps(rep, indent=2))
+        return 0
+    if args.cmd == "trace-report":
+        with open(args.trace_file, "r") as f:
+            trc = json.load(f)
+        print(json.dumps(trc.get("summary", trc), indent=2))
         return 0
     if args.cmd == "static-plan-compile":
         root = f"{args.pool_dir}/static_plans"

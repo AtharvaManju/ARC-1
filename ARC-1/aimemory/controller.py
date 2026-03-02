@@ -37,6 +37,10 @@ from .perf_envelope import PerformanceEnvelope
 from .topology import detect_topology
 from .allocator import allocator_snapshot
 from .roi import ROITracker, WorkloadIdentity
+from .memory_slo import MemorySLOContract, load_contract, MemorySLOEnforcer
+from .hybrid_optimizer import HybridMemoryOptimizer
+from .memory_trace import MemoryTraceRecorder
+from .policy_model import MemoryPolicyModel
 
 @dataclass
 class PackedRef:
@@ -152,6 +156,9 @@ class AIMemoryController:
                 ram_max_bytes=cfg.ram_max_bytes,
                 tenant_namespace=str(getattr(cfg, "tenant_namespace", "default")),
                 disk_quota_bytes=int(getattr(cfg, "disk_quota_bytes", cfg.max_pool_bytes)),
+                decompress_mode=str(getattr(cfg, "decompress_mode", "auto")),
+                gpu_decompress_min_bytes=int(getattr(cfg, "gpu_decompress_min_bytes", 8 * 1024 * 1024)),
+                direct_restore_enabled=bool(getattr(cfg, "direct_restore_enabled", True)),
             )
             self.io = IOWorkers(
                 storage=self.storage,
@@ -183,11 +190,15 @@ class AIMemoryController:
         self._step_start_evt: Optional[torch.cuda.Event] = None
         self._step_end_evt: Optional[torch.cuda.Event] = None
         self._step_spills_start: int = 0
-        ns = str(getattr(cfg, "tenant_namespace", "default")).strip().replace("/", "_").replace("..", "_")
-        if ns and ns not in ("default", "shared"):
-            self._agent_metrics_path = os.path.join(cfg.pool_dir, f"ns_{ns}", f"rank_{self.rank}", "agent_metrics.json")
+        if (not self._noop) and (self.storage is not None):
+            rank_root = str(self.storage.rank_dir)
         else:
-            self._agent_metrics_path = os.path.join(cfg.pool_dir, f"rank_{self.rank}", "agent_metrics.json")
+            ns = str(getattr(cfg, "tenant_namespace", "default")).strip().replace("/", "_").replace("..", "_")
+            if ns and ns not in ("default", "shared"):
+                rank_root = os.path.join(cfg.pool_dir, f"ns_{ns}", f"rank_{self.rank}")
+            else:
+                rank_root = os.path.join(cfg.pool_dir, f"rank_{self.rank}")
+        self._agent_metrics_path = os.path.join(rank_root, "agent_metrics.json")
         self._roi = ROITracker(str(getattr(cfg, "roi_dir", "") or os.path.join(cfg.pool_dir, "roi")))
         self._wid = WorkloadIdentity(
             model=str(getattr(cfg, "model_profile_name", "") or "default"),
@@ -197,6 +208,27 @@ class AIMemoryController:
             world_size=int(self.world_size),
             job=str(getattr(cfg, "workload_id", "") or ""),
         )
+        self._policy_model = MemoryPolicyModel(str(getattr(cfg, "policy_model_dir", "") or os.path.join(cfg.pool_dir, "policy_model")))
+        self._hybrid = HybridMemoryOptimizer(
+            io_tail_threshold_ms=float(getattr(cfg, "hybrid_io_tail_threshold_ms", 25.0)),
+            compute_headroom_pct=float(getattr(cfg, "hybrid_compute_headroom_pct", 12.0)),
+            recompute_bias=float(getattr(cfg, "hybrid_recompute_bias", 0.5)),
+        )
+        trace_out = str(getattr(cfg, "memory_trace_out_path", "") or os.path.join(rank_root, "memory_trace.json"))
+        self._trace = MemoryTraceRecorder(
+            max_events=int(getattr(cfg, "memory_trace_max_events", 20000)),
+            out_path=trace_out,
+        )
+        fallback_contract = MemorySLOContract(
+            never_oom=bool(getattr(cfg, "memory_slo_never_oom", False)),
+            max_hbm_bytes=int(getattr(cfg, "memory_slo_max_hbm_bytes", 0)),
+            p99_overhead_ms=float(getattr(cfg, "memory_slo_p99_overhead_ms", 0.0)),
+            p99_overhead_pct=float(getattr(cfg, "memory_slo_p99_overhead_pct", 0.0)),
+            policy=str(getattr(cfg, "memory_slo_policy", "balanced")),
+        )
+        contract = load_contract(str(getattr(cfg, "memory_slo_contract_path", "")), fallback=fallback_contract)
+        proof_dir = str(getattr(cfg, "memory_slo_proof_dir", "") or os.path.join(rank_root, "slo"))
+        self._slo = MemorySLOEnforcer(contract=contract, out_dir=proof_dir, rank=self.rank)
         self._autotuner = RuntimeAutoTuner(cfg, self.metrics)
         self._governor = MemoryGovernor(cfg, self.metrics)
         self._envelope = PerformanceEnvelope(cfg, self.metrics)
@@ -238,6 +270,11 @@ class AIMemoryController:
             self._logger.log({"evt": "init", "rank": self.rank, "world": self.world_size, "backend": self.backend})
 
     def shutdown(self):
+        try:
+            if bool(getattr(self.cfg, "memory_trace_enabled", True)):
+                self._trace.flush()
+        except Exception:
+            pass
         try:
             if self._native_runtime is not None:
                 self._native_runtime.close()
@@ -317,6 +354,7 @@ class AIMemoryController:
             "step_p95_ms": m.step_hist.pct(95),
             "step_p99_ms": m.step_hist.pct(99),
             "step_p999_ms": m.step_hist.pct(99.9),
+            "baseline_step_ms_ema": float(m.baseline_step_ms_ema.value),
             "spill_min_bytes": int(self.cfg.spill_min_bytes),
             "pcc_lookahead": int(self.cfg.pcc_lookahead),
             "governor_level": int(m.governor_level),
@@ -356,6 +394,26 @@ class AIMemoryController:
             "engine_uring": bool((self.storage is not None) and self.storage.engine.uring_enabled()),
             "backend_capabilities": dict(self._backend_caps),
             "backend_probe": dict(self._backend_probe),
+            "slo_contract": {
+                "never_oom": bool(self._slo.contract.never_oom),
+                "max_hbm_bytes": int(self._slo.contract.max_hbm_bytes),
+                "p99_overhead_ms": float(self._slo.contract.p99_overhead_ms),
+                "p99_overhead_pct": float(self._slo.contract.p99_overhead_pct),
+                "policy": str(self._slo.contract.policy),
+                "violations": int(self._slo.violations),
+            },
+            "hybrid_memory_recommendation": self._hybrid.as_recommendation(
+                io_tail_ms=max(float(m.io_read_hist.pct(99)), float(m.io_write_hist.pct(99))),
+                memory_headroom_pct=float(m.memory_headroom_pct),
+                policy=str(getattr(self.cfg, "memory_slo_policy", "balanced")),
+            ),
+            "memory_trace_summary": self._trace.summarize(),
+            "policy_model_samples": int(len(getattr(self._policy_model, "samples", []))),
+            "fast_path": {
+                "gds_enabled": bool((self.storage is not None) and self.storage.engine.gds_enabled()),
+                "decompress_path": str((self.storage.last_decompress_path if self.storage is not None else "none")),
+                "direct_restore_enabled": bool(getattr(self.cfg, "direct_restore_enabled", True)),
+            },
             "roi": self._roi.attribution(
                 self._wid,
                 {
@@ -371,13 +429,14 @@ class AIMemoryController:
     def compile_capture_parity_gate(self, baseline: Dict[str, float], candidate: Dict[str, float], tol_ratio: float = 0.05) -> Dict[str, Any]:
         return self._plan_compiler.compile_capture_parity(baseline=baseline, candidate=candidate, tol_ratio=tol_ratio)
 
-    def kv_register(self, key: str, tensor: torch.Tensor):
+    def kv_register(self, key: str, tensor: torch.Tensor, tenant_id: str = "default", request_id: str = ""):
         if getattr(self, "kv", None) is not None:
-            self.kv.register(key, tensor)
+            return self.kv.register(key, tensor, tenant_id=tenant_id, request_id=request_id)
+        return False
 
-    def kv_get(self, key: str) -> Optional[torch.Tensor]:
+    def kv_get(self, key: str, token_latency_ms: Optional[float] = None) -> Optional[torch.Tensor]:
         if getattr(self, "kv", None) is not None:
-            return self.kv.get(key)
+            return self.kv.get(key, token_latency_ms=token_latency_ms)
         return None
 
     def kv_release(self, key: str):
@@ -447,19 +506,62 @@ class AIMemoryController:
     def _pack_hook(self, t: torch.Tensor) -> PackedRef:
         self._pack_counter += 1
         pack_idx = self._pack_counter
+        nbytes_hint = int(t.numel() * t.element_size()) if hasattr(t, "numel") else 0
+
+        def _trace_inline(reason: str):
+            if bool(getattr(self.cfg, "memory_trace_enabled", True)):
+                self._trace.trace_pack(
+                    key="",
+                    nbytes=int(nbytes_hint),
+                    decision="inline",
+                    reason=str(reason),
+                    step=int(self._step_id),
+                    pack_idx=int(pack_idx),
+                )
+
+        def _trace_spill(key: str, reason: str, nbytes_v: int):
+            if bool(getattr(self.cfg, "memory_trace_enabled", True)):
+                self._trace.trace_pack(
+                    key=str(key),
+                    nbytes=int(nbytes_v),
+                    decision="spill",
+                    reason=str(reason),
+                    step=int(self._step_id),
+                    pack_idx=int(pack_idx),
+                )
 
         if bool(getattr(self.cfg, "compile_safe_mode", True)) and self._is_compiling():
+            _trace_inline("compile_safe_mode")
             return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
 
         if self._noop or (not t.is_cuda):
+            _trace_inline("non_cuda_or_noop")
             return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
 
         nbytes = int(t.numel() * t.element_size())
-        if (not self.metrics.spilling_enabled) or self.metrics.safe_mode or (nbytes < int(self.cfg.spill_min_bytes)):
+        if (not self.metrics.spilling_enabled):
+            _trace_inline("spilling_disabled")
             return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
+        if self.metrics.safe_mode:
+            _trace_inline("safe_mode")
+            return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
+        if nbytes < int(self.cfg.spill_min_bytes):
+            _trace_inline("small_tensor_inline")
+            return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
+        if bool(getattr(self.cfg, "hybrid_memory_optimizer_enabled", True)):
+            hy = self._hybrid.decide(
+                tensor_nbytes=nbytes,
+                io_tail_ms=max(float(self.metrics.io_read_hist.pct(99)), float(self.metrics.io_write_hist.pct(99))),
+                memory_headroom_pct=float(self.metrics.memory_headroom_pct),
+                policy=str(getattr(self.cfg, "memory_slo_policy", "balanced")),
+            )
+            if hy.action == "recompute":
+                _trace_inline("hybrid_recompute_preferred")
+                return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
         ok_budget, why = self._envelope.can_spill(nbytes=nbytes, rank=self.rank)
         if not ok_budget:
             self.metrics.disable_reason = f"spill_denied:{why}"
+            _trace_inline(f"spill_denied:{why}")
             return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
         if self.io is not None:
             fatal = self.io.fatal_error()
@@ -467,6 +569,7 @@ class AIMemoryController:
                 self.metrics.spilling_enabled = False
                 self.metrics.safe_mode = True
                 self.metrics.disable_reason = f"Fail-open after IO error: {fatal}"
+                _trace_inline("fail_open_io_error")
                 return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
         if self._native_runtime is not None:
             nf = self._native_runtime.fatal()
@@ -474,6 +577,7 @@ class AIMemoryController:
                 self.metrics.spilling_enabled = False
                 self.metrics.safe_mode = True
                 self.metrics.disable_reason = f"Fail-open after native runtime error: {nf}"
+                _trace_inline("fail_open_native_error")
                 return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
 
         if not t.is_contiguous():
@@ -493,6 +597,7 @@ class AIMemoryController:
                 self._envelope.note_spill(nbytes=nbytes, rank=self.rank)
                 self.metrics.spills += 1
                 self.metrics.spill_bytes += nbytes
+                _trace_spill(key, "native_submit", nbytes)
                 return PackedRef(kind="SPILLED", pack_idx=pack_idx, key=key, dtype_s=dtype_s, shape=shape, nbytes=nbytes)
 
         padded_plain = int(round_up(nbytes, 4096))
@@ -502,6 +607,7 @@ class AIMemoryController:
         if blk is None:
             # Respect pinned pool budget: if no block is available, keep inline.
             self.metrics.spill_inline_pool_exhausted += 1
+            _trace_inline("pinned_pool_exhausted")
             return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
 
         src_u8 = t.view(torch.uint8).reshape(-1)
@@ -551,6 +657,7 @@ class AIMemoryController:
                 self.metrics.spilling_enabled = False
                 self.metrics.safe_mode = True
                 self.metrics.disable_reason = "Queue overflow: spilling disabled"
+                _trace_inline("queue_overflow_disable")
                 return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
 
             # SYNC_SPILL fallback: write spill in caller thread to preserve correctness.
@@ -579,6 +686,7 @@ class AIMemoryController:
                 self.io.clear_spill_done(key)
                 self._spill_done_events.pop(key, None)
                 self._step_keys_by_pack.pop(pack_idx, None)
+                _trace_inline("queue_overflow_unknown_policy")
                 return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
 
         if bool(getattr(self.cfg, "pack_wait_for_commit", False)):
@@ -592,12 +700,14 @@ class AIMemoryController:
                     self.io.clear_spill_done(key)
                     self._spill_done_events.pop(key, None)
                     self._step_keys_by_pack.pop(pack_idx, None)
+                    _trace_inline("commit_error_fail_open")
                     return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
                 raise RuntimeError(f"AIMemory spill commit failed for key={key}: {fatal}")
 
         self.metrics.spills += 1
         self.metrics.spill_bytes += nbytes
         self._envelope.note_spill(nbytes=nbytes, rank=self.rank)
+        _trace_spill(key, "queued_spill", nbytes)
         return PackedRef(kind="SPILLED", pack_idx=pack_idx, key=key, dtype_s=dtype_s, shape=shape, nbytes=nbytes)
 
     def _unpack_hook(self, ref: PackedRef) -> torch.Tensor:
@@ -623,11 +733,13 @@ class AIMemoryController:
             self.pcc.record_restore(ref.pack_idx)
 
         key = ref.key
+        restore_wait_ms = 0.0
         done_evt = self._spill_done_events.get(key)
         if done_evt is not None and not done_evt.is_set():
             t0 = time.time()
             done_evt.wait()
             dt_ms = (time.time() - t0) * 1000.0
+            restore_wait_ms = float(dt_ms)
             self.metrics.spill_commit_wait_ms_ema.update(dt_ms)
             self.metrics.restore_wait_hist.add(dt_ms)
 
@@ -640,6 +752,15 @@ class AIMemoryController:
         try:
             if out is not None:
                 self.metrics.prefetch_hits += 1
+                if bool(getattr(self.cfg, "memory_trace_enabled", True)):
+                    self._trace.trace_restore(
+                        key=key,
+                        nbytes=int(ref.nbytes),
+                        source="prefetch",
+                        stall_ms=float(restore_wait_ms),
+                        step=int(self._step_id),
+                        pack_idx=int(ref.pack_idx),
+                    )
             else:
                 self.metrics.prefetch_misses += 1
                 try:
@@ -655,59 +776,85 @@ class AIMemoryController:
                             raise RuntimeError(f"AIMemory spill commit failed for key={key}: {fatal}") from e
                         raise
                     meta = self.storage.get_meta(key)
-
-                enc_blk = None
-                plain_blk = None
-                work_blk = None
-                owns_plain = False
-                owns_work = False
-                try:
-                    enc_blk = self.storage.acquire_pinned(meta.padded_bytes)
-                    try:
-                        self.storage.mark_prefetching(key)
-                    except Exception:
-                        pass
-                    t0_io = time.time()
-                    self.storage.read_block_to_pinned(meta, enc_blk)
-                    self.metrics.io_read_hist.add((time.time() - t0_io) * 1000.0)
-
-                    t0_decode = time.time()
-                    plain_blk, work_blk, owns_plain, owns_work = self.storage.decode_to_plain_block(
-                        meta, enc_blk, scratch_plain=None, scratch_work=None
-                    )
-                    dt_decode = (time.time() - t0_decode) * 1000.0
-                    self.metrics.decode_hist.add(dt_decode)
-                    if int(getattr(meta, "compressed", 0)) == 1:
-                        self.metrics.decompress_hist.add(dt_decode)
-
-                    out = torch.empty(meta.shape, device="cuda", dtype=str_to_dtype(meta.dtype_s))
-                    src_u8 = plain_blk.u8[:meta.nbytes].view(torch.uint8).reshape(-1)
-                    out_u8 = out.view(torch.uint8).reshape(-1)
-                    t0_h2d = time.time()
-                    if self._restore_stream is not None:
-                        evt = torch.cuda.Event(enable_timing=False, blocking=False)
-                        with torch.cuda.stream(self._restore_stream):
-                            out_u8.copy_(src_u8, non_blocking=True)
-                            evt.record(self._restore_stream)
-                        t0_sync = time.time()
-                        torch.cuda.current_stream().wait_event(evt)
-                        self.metrics.stream_sync_hist.add((time.time() - t0_sync) * 1000.0)
-                    else:
-                        out_u8.copy_(src_u8, non_blocking=True)
-                    self.metrics.h2d_copy_hist.add((time.time() - t0_h2d) * 1000.0)
-                    try:
-                        self.storage.mark_resident(key)
-                    except Exception:
-                        pass
-                    self.storage.mark_restored(key)
+                # Try hardware direct path first (GDS-like) if available.
+                out = torch.empty(meta.shape, device="cuda", dtype=str_to_dtype(meta.dtype_s))
+                direct_restored = False
+                t0_direct = time.time()
+                if self.storage.try_restore_direct_to_cuda(meta, out):
+                    direct_restored = True
+                    self.metrics.h2d_copy_hist.add((time.time() - t0_direct) * 1000.0)
                     out.record_stream(torch.cuda.current_stream())
-                finally:
-                    if enc_blk is not None:
-                        self.storage.release_pinned(enc_blk)
-                    if owns_plain and plain_blk is not None:
-                        self.storage.release_pinned(plain_blk)
-                    if owns_work and work_blk is not None:
-                        self.storage.release_pinned(work_blk)
+                    if bool(getattr(self.cfg, "memory_trace_enabled", True)):
+                        self._trace.trace_restore(
+                            key=key,
+                            nbytes=int(ref.nbytes),
+                            source="direct_restore",
+                            stall_ms=float(restore_wait_ms),
+                            step=int(self._step_id),
+                            pack_idx=int(ref.pack_idx),
+                        )
+                if not direct_restored:
+                    enc_blk = None
+                    plain_blk = None
+                    work_blk = None
+                    owns_plain = False
+                    owns_work = False
+                    try:
+                        enc_blk = self.storage.acquire_pinned(meta.padded_bytes)
+                        try:
+                            self.storage.mark_prefetching(key)
+                        except Exception:
+                            pass
+                        t0_io = time.time()
+                        self.storage.read_block_to_pinned(meta, enc_blk)
+                        self.metrics.io_read_hist.add((time.time() - t0_io) * 1000.0)
+
+                        t0_decode = time.time()
+                        plain_blk, work_blk, owns_plain, owns_work = self.storage.decode_to_plain_block(
+                            meta, enc_blk, scratch_plain=None, scratch_work=None
+                        )
+                        dt_decode = (time.time() - t0_decode) * 1000.0
+                        self.metrics.decode_hist.add(dt_decode)
+                        if int(getattr(meta, "compressed", 0)) == 1:
+                            self.metrics.decompress_hist.add(dt_decode)
+
+                        out = torch.empty(meta.shape, device="cuda", dtype=str_to_dtype(meta.dtype_s))
+                        src_u8 = plain_blk.u8[:meta.nbytes].view(torch.uint8).reshape(-1)
+                        out_u8 = out.view(torch.uint8).reshape(-1)
+                        t0_h2d = time.time()
+                        if self._restore_stream is not None:
+                            evt = torch.cuda.Event(enable_timing=False, blocking=False)
+                            with torch.cuda.stream(self._restore_stream):
+                                out_u8.copy_(src_u8, non_blocking=True)
+                                evt.record(self._restore_stream)
+                            t0_sync = time.time()
+                            torch.cuda.current_stream().wait_event(evt)
+                            self.metrics.stream_sync_hist.add((time.time() - t0_sync) * 1000.0)
+                        else:
+                            out_u8.copy_(src_u8, non_blocking=True)
+                        self.metrics.h2d_copy_hist.add((time.time() - t0_h2d) * 1000.0)
+                        try:
+                            self.storage.mark_resident(key)
+                        except Exception:
+                            pass
+                        self.storage.mark_restored(key)
+                        out.record_stream(torch.cuda.current_stream())
+                        if bool(getattr(self.cfg, "memory_trace_enabled", True)):
+                            self._trace.trace_restore(
+                                key=key,
+                                nbytes=int(ref.nbytes),
+                                source="sync_restore",
+                                stall_ms=float(restore_wait_ms),
+                                step=int(self._step_id),
+                                pack_idx=int(ref.pack_idx),
+                            )
+                    finally:
+                        if enc_blk is not None:
+                            self.storage.release_pinned(enc_blk)
+                        if owns_plain and plain_blk is not None:
+                            self.storage.release_pinned(plain_blk)
+                        if owns_work and work_blk is not None:
+                            self.storage.release_pinned(work_blk)
 
         except Exception as e:
             if "out of memory" in str(e).lower():
@@ -885,6 +1032,41 @@ class AIMemoryController:
                         json.dump(snap, f, indent=2)
                 except Exception:
                     pass
+                try:
+                    c._slo.emit_proof(c.metrics_snapshot())
+                except Exception as e:
+                    if c._logger:
+                        c._logger.log({"evt": "slo_proof_warn", "err": safe_exc(e)})
+                try:
+                    if bool(getattr(c.cfg, "memory_trace_enabled", True)) and (c._step_id % 10 == 0):
+                        c._trace.flush()
+                except Exception as e:
+                    if c._logger:
+                        c._logger.log({"evt": "trace_flush_warn", "err": safe_exc(e)})
+                try:
+                    if c._step_id % max(5, int(getattr(c.cfg, "autotune_adjust_interval_steps", 10))) == 0:
+                        features = {
+                            "model_fingerprint": str(getattr(c.cfg, "model_profile_name", "") or "default"),
+                            "world_size": int(c.world_size),
+                            "seq_len": int(getattr(c._wid, "seq_len", 0)),
+                            "batch_size": int(getattr(c._wid, "batch_size", 0)),
+                            "policy": str(getattr(c.cfg, "memory_slo_policy", "balanced")),
+                            "hbm_bytes": int(c.metrics.memory_total_bytes),
+                            "nvme_write_mb_s": float(c._backend_probe.get("write_mb_s", 0.0)),
+                            "nvme_read_mb_s": float(c._backend_probe.get("write_mb_s", 0.0)),
+                        }
+                        policy = {
+                            "spill_min_bytes": int(c.cfg.spill_min_bytes),
+                            "pcc_lookahead": int(c.cfg.pcc_lookahead),
+                            "io_workers": int(c.cfg.io_workers),
+                            "max_queue": int(c.cfg.max_queue),
+                            "predicted_uplift_pct": float(c.metrics.memory_headroom_pct),
+                        }
+                        score = float(1000.0 / max(1e-6, c.metrics.step_ms_ema.value)) if c.metrics.step_ms_ema.value > 0 else 0.0
+                        c._policy_model.add_sample(features, policy, score=score)
+                except Exception as e:
+                    if c._logger:
+                        c._logger.log({"evt": "policy_model_warn", "err": safe_exc(e)})
                 if (
                     c.rank == 0
                     and bool(getattr(c.cfg, "policy_auto_rollback_enabled", True))

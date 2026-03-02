@@ -12,6 +12,7 @@ from .bench import run_bench
 from .headroom_gate import run_headroom_gate
 from aimemory.config import AIMemoryConfig
 from aimemory.controller import AIMemoryController
+from aimemory.parity_cert import certify_training_outcome_parity
 
 
 class _Tiny(nn.Module):
@@ -27,11 +28,11 @@ class _Tiny(nn.Module):
         return self.net(x)
 
 
-def _convergence_delta(pool_dir: str, d: int = 2048, steps: int = 3, dtype: torch.dtype = torch.float16) -> float:
+def _convergence_pair(pool_dir: str, d: int = 2048, steps: int = 3, dtype: torch.dtype = torch.float16):
     torch.manual_seed(1234)
     xb = [torch.randn(8, d, device="cuda", dtype=dtype) for _ in range(steps)]
 
-    def _run(use_ai: bool) -> float:
+    def _run(use_ai: bool):
         model = _Tiny(d).to(device="cuda", dtype=dtype).train()
         opt = optim.AdamW(model.parameters(), lr=1e-3)
         ctrl = None
@@ -50,30 +51,48 @@ def _convergence_delta(pool_dir: str, d: int = 2048, steps: int = 3, dtype: torc
                 opt.zero_grad(set_to_none=True)
             ctrl.finalize_pcc_profile()
 
-        last = 0.0
+        losses = []
+        grads = []
         for i in range(1, steps):
             if ctrl:
                 with ctrl.step():
                     y = model(xb[i])
                     loss = y.float().pow(2).mean()
                     loss.backward()
-                    last = float(loss.item())
+                    losses.append(float(loss.item()))
+                    gn = 0.0
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            gn += float(p.grad.float().norm().item())
+                    grads.append(float(gn))
                 opt.step()
                 opt.zero_grad(set_to_none=True)
             else:
                 y = model(xb[i])
                 loss = y.float().pow(2).mean()
                 loss.backward()
-                last = float(loss.item())
+                losses.append(float(loss.item()))
+                gn = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        gn += float(p.grad.float().norm().item())
+                grads.append(float(gn))
                 opt.step()
                 opt.zero_grad(set_to_none=True)
         if ctrl:
             ctrl.shutdown()
-        return last
+        return losses, grads
 
     base = _run(False)
     ai = _run(True)
-    return abs(ai - base) / max(1e-8, abs(base))
+    return base, ai
+
+
+def _convergence_delta(pool_dir: str, d: int = 2048, steps: int = 3, dtype: torch.dtype = torch.float16) -> float:
+    base, ai = _convergence_pair(pool_dir=pool_dir, d=d, steps=steps, dtype=dtype)
+    base_last = float(base[0][-1] if base[0] else 0.0)
+    ai_last = float(ai[0][-1] if ai[0] else 0.0)
+    return abs(ai_last - base_last) / max(1e-8, abs(base_last))
 
 
 def _avg_step_ms_baseline(d: int = 2048, steps: int = 8, dtype: torch.dtype = torch.float16) -> float:
@@ -171,13 +190,33 @@ def run_qualification(
         dtype_s="float16",
         max_probe=8192,
     )
-    conv_delta = _convergence_delta(pool_dir=pool_dir)
+    base_pair, ai_pair = _convergence_pair(pool_dir=pool_dir)
+    base_last = float(base_pair[0][-1] if base_pair[0] else 0.0)
+    ai_last = float(ai_pair[0][-1] if ai_pair[0] else 0.0)
+    conv_delta = abs(ai_last - base_last) / max(1e-8, abs(base_last))
+    outcome_parity = certify_training_outcome_parity(
+        {
+            "loss_curve": list(base_pair[0]),
+            "grad_norm_curve": list(base_pair[1]),
+            "reproducibility_mode": True,
+            "reproducibility_checksum": float(sum(base_pair[0]) + sum(base_pair[1])),
+        },
+        {
+            "loss_curve": list(ai_pair[0]),
+            "grad_norm_curve": list(ai_pair[1]),
+            "reproducibility_mode": True,
+            "reproducibility_checksum": float(sum(ai_pair[0]) + sum(ai_pair[1])),
+        },
+        loss_delta_pct_max=5.0,
+        grad_stat_delta_pct_max=8.0,
+        reproducibility_tolerance=1e-5,
+    )
     pass_headroom = bool(gate.get("passed", False))
     step_ms = float(bench.get("step_ms_avg", 0.0))
     baseline_ms = _avg_step_ms_baseline()
     overhead_pct = (100.0 * (step_ms / baseline_ms - 1.0)) if baseline_ms > 0 else 0.0
     pass_overhead = overhead_pct <= float(overhead_sla_pct)
-    pass_conv = conv_delta <= 0.05
+    pass_conv = (conv_delta <= 0.05) and bool(outcome_parity.ok)
     pressure_base = _pressure_profile(pool_dir=pool_dir, use_aimemory=False)
     pressure_ai = _pressure_profile(pool_dir=pool_dir, use_aimemory=True)
     p95_overhead = (
@@ -256,6 +295,14 @@ def run_qualification(
             "performance_envelope": bench.get("metrics", {}).get("performance_envelope", {}),
         },
         "compile_capture_parity": parity,
+        "training_outcome_parity": {
+            "ok": bool(outcome_parity.ok),
+            "loss_curve_max_delta_pct": float(outcome_parity.loss_curve_max_delta_pct),
+            "grad_mean_delta_pct": float(outcome_parity.grad_mean_delta_pct),
+            "grad_std_delta_pct": float(outcome_parity.grad_std_delta_pct),
+            "reproducibility_pass": bool(outcome_parity.reproducibility_pass),
+            "reasons": list(outcome_parity.reasons),
+        },
         "gates": gates,
         "rollout_decision": rollout,
         "rollout_reasons": [k for k, v in gates.items() if not bool(v.get("pass", False))],
