@@ -114,7 +114,7 @@ def run_agent(bind: str, port: int, metrics_path: str = "", heartbeat_path: str 
             return
 
     srv = ThreadingHTTPServer((bind, int(port)), _Handler)
-    print(f"[aimemory-agent] listening on http://{bind}:{port}")
+    print(f"[arc1-agent] listening on http://{bind}:{port}")
     try:
         srv.serve_forever()
     finally:

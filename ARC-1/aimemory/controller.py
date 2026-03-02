@@ -61,7 +61,7 @@ class AIMemoryController:
         self.world_size = int(cfg.world_size) if cfg.world_size >= 0 else int(det_world if is_dist else 1)
 
         if cfg.warn_on_multinode and is_multinode:
-            print("[aimemory] WARNING: multi-node detected. Use per-node local pool_dir. Shared FS not supported.")
+            print("[ARC-1] WARNING: multi-node detected. Use per-node local pool_dir. Shared FS not supported.")
         if is_multinode and bool(getattr(cfg, "strict_local_pool", True)) and path_is_likely_remote(cfg.pool_dir):
             raise RuntimeError(f"pool_dir appears non-local for multi-node setup: {cfg.pool_dir}")
 
@@ -128,7 +128,7 @@ class AIMemoryController:
             try:
                 self._logger = JsonlLogger(default_rank_log_path(cfg.pool_dir, self.rank))
             except Exception as e:
-                print(f"[aimemory] logger disabled: {safe_exc(e)}")
+                print(f"[ARC-1] logger disabled: {safe_exc(e)}")
                 self._logger = None
 
         if self._noop:
@@ -702,7 +702,7 @@ class AIMemoryController:
                     self._step_keys_by_pack.pop(pack_idx, None)
                     _trace_inline("commit_error_fail_open")
                     return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
-                raise RuntimeError(f"AIMemory spill commit failed for key={key}: {fatal}")
+                raise RuntimeError(f"ARC-1 spill commit failed for key={key}: {fatal}")
 
         self.metrics.spills += 1
         self.metrics.spill_bytes += nbytes
@@ -773,7 +773,7 @@ class AIMemoryController:
                     ):
                         fatal = self.io.fatal_error()
                         if fatal is not None:
-                            raise RuntimeError(f"AIMemory spill commit failed for key={key}: {fatal}") from e
+                            raise RuntimeError(f"ARC-1 spill commit failed for key={key}: {fatal}") from e
                         raise
                     meta = self.storage.get_meta(key)
                 # Try hardware direct path first (GDS-like) if available.
@@ -868,7 +868,7 @@ class AIMemoryController:
                 self._logger.log({"evt": "restore_fail", "err": safe_exc(e), "key": key})
             if self.cfg.hard_fail_on_corruption:
                 raise
-            raise RuntimeError(f"AIMemory restore failed: {type(e).__name__}: {e}") from e
+            raise RuntimeError(f"ARC-1 restore failed: {type(e).__name__}: {e}") from e
 
         self.metrics.restores += 1
         self.metrics.restore_bytes += int(ref.nbytes)

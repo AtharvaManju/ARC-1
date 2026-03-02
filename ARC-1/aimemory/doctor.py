@@ -14,7 +14,7 @@ def _cmd_ok(cmd):
         return False
 
 def run_doctor(pool_dir="/mnt/nvme_pool"):
-    print("[AIMemory Doctor]")
+    print("[ARC-1 Doctor]")
     print("  - platform:", platform.platform())
     print("  - python:", sys.version.split()[0])
 

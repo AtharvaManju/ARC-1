@@ -379,7 +379,7 @@ class SARCStorage:
             conn.close()
             raise RuntimeError(
                 f"metadata db schema {uv} is newer than supported {DB_SCHEMA_VERSION}; "
-                "upgrade AIMemory runtime for forward-compatibility"
+                "upgrade ARC-1 runtime for forward-compatibility"
             )
         cols = [r[1] for r in conn.execute("PRAGMA table_info(tensors)").fetchall()]
         if "step_id" not in cols:

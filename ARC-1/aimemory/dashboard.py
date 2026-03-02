@@ -1,6 +1,6 @@
 def Dashboard(*args, **kwargs):
     raise RuntimeError(
-        "Dashboard requires extras. Install with: pip install 'aimemory[dashboard]'"
+        "Dashboard requires extras. Install with: pip install 'arc1[dashboard]'"
     )
 
 try:
@@ -10,7 +10,7 @@ try:
     import pynvml
 
     class Dashboard:  # type: ignore
-        def __init__(self, ctrl, title="AIMemory"):
+        def __init__(self, ctrl, title="ARC-1"):
             self.ctrl = ctrl
             self.title = title
             pynvml.nvmlInit()

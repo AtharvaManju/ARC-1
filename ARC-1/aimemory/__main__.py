@@ -23,7 +23,7 @@ from aimemory.parity_cert import certify_from_files
 from aimemory.policy_model import MemoryPolicyModel
 
 def main():
-    p = argparse.ArgumentParser(prog="aimemory")
+    p = argparse.ArgumentParser(prog="arc1")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     d = sub.add_parser("doctor")

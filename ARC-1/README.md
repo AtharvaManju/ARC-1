@@ -1,6 +1,6 @@
-# AIMemory v0.10.2 — Plug-and-Play Tiers
+# ARC-1 v0.10.2 — Plug-and-Play Tiers
 
-AIMemory reduces effective VRAM usage by spilling large autograd saved tensors.
+ARC-1 reduces effective VRAM usage by spilling large autograd saved tensors.
 
 ## Tiers
 - **Tier 0 (Always works):** CPU-only imports and runs in **NOOP** mode.
@@ -11,12 +11,12 @@ AIMemory reduces effective VRAM usage by spilling large autograd saved tensors.
 ## Install
 Base (works everywhere):
 ```bash
-pip install aimemory
+pip install arc1
 ```
 
 Enable dashboard:
 ```bash
-pip install "aimemory[dashboard]"
+pip install "arc1[dashboard]"
 ```
 
 Install engine:
@@ -25,14 +25,20 @@ pip install aimemory-engine
 ```
 
 ## Important perf note
-By default, AIMemory does **not** call `torch.cuda.synchronize()` each step.
+By default, ARC-1 does **not** call `torch.cuda.synchronize()` each step.
 Step timing uses **CUDA events** (stream-local wait) to avoid destroying overlap.
 If you want a full device sync each step (debug/bench), set:
 ```py
 cfg.sync_each_step = True
 ```
 
-## Quick Start
+## One-Line Start
+```py
+import arc1
+arc1.enable()
+```
+
+## Advanced Start
 ```py
 from aimemory.config import AIMemoryConfig
 from aimemory.controller import AIMemoryController
@@ -50,12 +56,12 @@ for _ in range(1000):
 ```
 
 ## Ops
-- `aimemory doctor`
-- `aimemory gc`
-- `aimemory support-bundle --out bundle.zip`
-- `aimemory headroom-gate --pool-dir /mnt/nvme_pool --out ./aimemory_headroom_gate.json`
-- `aimemory qualify --pool-dir /mnt/nvme_pool --out ./aimemory_qualification.json`
-- `aimemory consistency-check --pool-dir /mnt/nvme_pool --rank 0`
-- `aimemory policy-push --pool-dir /mnt/nvme_pool --name prod --file policy.json`
-- `aimemory fleet-report --pool-dir /mnt/nvme_pool`
-- `aimemory agent --bind 0.0.0.0 --port 9765`
+- `arc1 doctor`
+- `arc1 gc`
+- `arc1 support-bundle --out bundle.zip`
+- `arc1 headroom-gate --pool-dir /mnt/nvme_pool --out ./aimemory_headroom_gate.json`
+- `arc1 qualify --pool-dir /mnt/nvme_pool --out ./aimemory_qualification.json`
+- `arc1 consistency-check --pool-dir /mnt/nvme_pool --rank 0`
+- `arc1 policy-push --pool-dir /mnt/nvme_pool --name prod --file policy.json`
+- `arc1 fleet-report --pool-dir /mnt/nvme_pool`
+- `arc1 agent --bind 0.0.0.0 --port 9765`
