@@ -66,3 +66,10 @@ for _ in range(1000):
 - `arc1 agent --bind 0.0.0.0 --port 9765`
 - `arc1 ga-readiness --pool-dir /mnt/nvme_pool --qualification ./aimemory_qualification.json`
 - `arc1 commercial-pack --pool-dir /mnt/nvme_pool --qualification ./aimemory_qualification.json --out-dir ./arc1_pack`
+- `arc1 compile-matrix --out ./arc1_compile_matrix.json`
+- `arc1 parity-longrun --pool-dir /mnt/nvme_pool --out ./arc1_parity_longrun.json`
+- `arc1 fastpath-qualify --pool-dir /mnt/nvme_pool --out ./arc1_fastpath_qualification.json`
+- `arc1 migration-report --path . --out ./arc1_migration_report.json`
+- `arc1 security-threat-model --out ./arc1_threat_model.json`
+- `arc1 security-audit --pool-dir /mnt/nvme_pool --out ./arc1_security_audit.json`
+- `arc1 claims-evidence --qualification ./aimemory_qualification.json --fastpath ./arc1_fastpath_qualification.json --out ./arc1_claims_evidence.json`

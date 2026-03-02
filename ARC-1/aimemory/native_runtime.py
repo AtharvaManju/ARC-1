@@ -41,6 +41,7 @@ class NativeRuntime:
         self.step_budget_bytes = max(0, int(getattr(cfg, "native_step_budget_bytes", 16 * 1024**3)))
         self.adaptive_batching = bool(getattr(cfg, "native_adaptive_batching", True))
         self.target_batch_latency_s = max(0.0001, float(getattr(cfg, "native_target_batch_latency_ms", 1.0)) / 1000.0)
+        self.own_io_path = bool(getattr(cfg, "native_own_io_path", True))
 
         self._q: "queue.Queue[NativeSubmit]" = queue.Queue(maxsize=max(64, self.max_batch_ops * 8))
         self._stop = threading.Event()
@@ -86,6 +87,7 @@ class NativeRuntime:
             "queue_depth": int(self._q.qsize()),
             "batch_latency_ms_ema": float(self._batch_latency_ms_ema),
             "native_budget_denials": int(self._budget_denials),
+            "own_io_path": bool(self.own_io_path),
         }
 
     def update_prefetch_schedule(self, items: List[tuple[str, object]]):
@@ -168,19 +170,34 @@ class NativeRuntime:
                 blk.u8[:sub.nbytes].copy_(src_u8, non_blocking=True)
                 ready_evt = torch.cuda.Event(enable_timing=False, blocking=False)
                 ready_evt.record(torch.cuda.current_stream())
-                self.io.submit_spill_host(
-                    SpillHostJob(
+                if self.own_io_path:
+                    ready_evt.synchronize()
+                    t0_write = time.time()
+                    self.storage.put_host_bytes(
                         key=sub.key,
-                        step_id=sub.step_id,
-                        pinned_block=blk,
+                        plain_blk=blk,
                         nbytes=sub.nbytes,
                         dtype_s=dtype_to_str(t.dtype),
                         shape=sub.shape,
-                        ready_evt=ready_evt,
-                        done_evt=sub.done_evt,
-                    ),
-                    timeout_s=float(getattr(self.cfg, "queue_put_timeout_s", 0.01)),
-                )
+                        step_id=sub.step_id,
+                        spill_done_evt=sub.done_evt,
+                    )
+                    self.metrics.io_write_hist.add((time.time() - t0_write) * 1000.0)
+                    self.io.release_pinned(blk)
+                else:
+                    self.io.submit_spill_host(
+                        SpillHostJob(
+                            key=sub.key,
+                            step_id=sub.step_id,
+                            pinned_block=blk,
+                            nbytes=sub.nbytes,
+                            dtype_s=dtype_to_str(t.dtype),
+                            shape=sub.shape,
+                            ready_evt=ready_evt,
+                            done_evt=sub.done_evt,
+                        ),
+                        timeout_s=float(getattr(self.cfg, "queue_put_timeout_s", 0.01)),
+                    )
                 self._ops += 1
                 self._logical_chunks += int(sub.logical_chunks)
                 self._state_updates += 1

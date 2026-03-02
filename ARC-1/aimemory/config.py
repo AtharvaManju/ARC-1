@@ -126,6 +126,7 @@ class AIMemoryConfig:
     native_step_budget_bytes: int = 16 * 1024**3
     native_adaptive_batching: bool = True
     native_target_batch_latency_ms: float = 1.0
+    native_own_io_path: bool = True
 
     # Static spill plan / compile-capture
     static_plan_mode: bool = False
@@ -140,10 +141,12 @@ class AIMemoryConfig:
 
     # Distributed coordination
     distributed_coordination_enabled: bool = True
+    coordination_backend: str = "AUTO"  # AUTO | FILE | COLLECTIVE
     coordination_dir: str = ""
     coordination_interval_steps: int = 5
     coordination_leader_rank: int = 0
     coordination_timeout_s: float = 1.0
+    coordination_collective_timeout_s: float = 2.0
     coordination_rank_stale_s: float = 5.0
     coordination_min_quorum_ratio: float = 0.75
     anti_skew_enabled: bool = True
@@ -160,6 +163,8 @@ class AIMemoryConfig:
     kv_tenant_fairness: bool = True
     kv_tenant_budget_ratio: float = 0.25
     kv_hard_tenant_cap: bool = False
+    kv_backend_adapter: str = ""  # "", "paged_attention_like", or "module:Class"
+    kv_backend_allow_fallback: bool = True
 
     # Control-plane / agent
     control_plane_dir: str = ""

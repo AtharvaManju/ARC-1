@@ -1,0 +1,56 @@
+name: ARC-1 GA
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  noncuda-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e .
+
+      - name: Compile Check
+        run: python -m compileall -q aimemory arc1 tests
+
+      - name: Run Non-CUDA Script Tests
+        env:
+          PYTHONPATH: .
+        run: |
+          set -euo pipefail
+          for t in tests/run_*.py; do
+            case "$t" in
+              tests/run_correctness.py|tests/run_ddp_correctness.py) continue ;;
+            esac
+            python "$t"
+          done
+
+      - name: Generate GA/Commercial Artifacts
+        env:
+          PYTHONPATH: .
+        run: |
+          set -euo pipefail
+          mkdir -p ci_artifacts
+          python -m arc1 ga-readiness --pool-dir /tmp/arc1_pool --out ci_artifacts/ga_readiness.json
+          python -m arc1 commercial-pack --pool-dir /tmp/arc1_pool --out-dir ci_artifacts/commercial --customer ci
+          python -m arc1 security-threat-model --out ci_artifacts/threat_model.json
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: arc1-ga-artifacts
+          path: ci_artifacts

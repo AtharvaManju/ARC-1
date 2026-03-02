@@ -32,6 +32,7 @@ from .governor import MemoryGovernor
 from .native_runtime import NativeRuntime
 from .static_plan import StaticPlanCompiler, model_fingerprint_full
 from .distributed_coord import RankCoordinator
+from .distributed_collective import CollectiveCoordinator
 from .kv_manager import KVResidencyManager
 from .perf_envelope import PerformanceEnvelope
 from .topology import detect_topology
@@ -250,15 +251,33 @@ class AIMemoryController:
                 self._static_plan_lookup = {int(e.pack_idx): int(e.prefetch_lookahead) for e in self._static_plan.entries}
 
         self._rank_coord = None
+        self._collective_coord = None
+        self._coord_backend = "NONE"
         self._topology = detect_topology(rank=self.rank)
         coord_dir = str(getattr(cfg, "coordination_dir", "") or os.path.join(cfg.pool_dir, "coordination"))
         if bool(getattr(cfg, "distributed_coordination_enabled", True)) and int(self.world_size) > 1:
-            self._rank_coord = RankCoordinator(
-                root_dir=coord_dir,
-                rank=self.rank,
-                world_size=self.world_size,
-                leader_rank=int(getattr(cfg, "coordination_leader_rank", 0)),
-            )
+            cback = str(getattr(cfg, "coordination_backend", "AUTO")).strip().upper()
+            if cback == "AUTO":
+                try:
+                    import torch.distributed as dist
+                    cback = "COLLECTIVE" if bool(dist.is_available() and dist.is_initialized()) else "FILE"
+                except Exception:
+                    cback = "FILE"
+            if cback == "COLLECTIVE":
+                self._collective_coord = CollectiveCoordinator(
+                    rank=self.rank,
+                    world_size=self.world_size,
+                    leader_rank=int(getattr(cfg, "coordination_leader_rank", 0)),
+                )
+                self._coord_backend = "COLLECTIVE"
+            else:
+                self._rank_coord = RankCoordinator(
+                    root_dir=coord_dir,
+                    rank=self.rank,
+                    world_size=self.world_size,
+                    leader_rank=int(getattr(cfg, "coordination_leader_rank", 0)),
+                )
+                self._coord_backend = "FILE"
         self._spill_stream: Optional[torch.cuda.Stream] = None
         self._restore_stream: Optional[torch.cuda.Stream] = None
         self._spill_order_evt: Optional[torch.cuda.Event] = None
@@ -381,7 +400,8 @@ class AIMemoryController:
             "native_runtime": (self._native_runtime.stats() if self._native_runtime is not None else {"enabled": False}),
             "static_plan_mode": bool(getattr(self.cfg, "static_plan_mode", False)),
             "static_plan_key": str(self._static_plan.plan_key) if self._static_plan is not None else "",
-            "distributed_coordination": bool(self._rank_coord is not None),
+            "distributed_coordination": bool((self._rank_coord is not None) or (self._collective_coord is not None)),
+            "coordination_backend": str(self._coord_backend),
             "reproducibility_mode": bool(getattr(self.cfg, "reproducibility_mode", False)),
             "collective_safe_mode": bool(getattr(self.cfg, "collective_safe_mode", True)),
             "topology": dict(self._topology),
@@ -954,9 +974,8 @@ class AIMemoryController:
                 c.metrics.disable_reason = "graph_safe_mode requires static plan"
 
             if bool(getattr(c.cfg, "native_disable_python_callbacks", False)):
-                # Explicit bypass mode for environments that run a native/autograph integration.
-                c.metrics.disable_reason = "python_callbacks_bypassed"
-                return self
+                # Keep hooks active for correctness, but mark native ownership preference.
+                c.metrics.disable_reason = "python_callbacks_minimal_mode"
 
             c._hooks_ctx = torch.autograd.graph.saved_tensors_hooks(c._pack_hook, c._unpack_hook)
             c._hooks_ctx.__enter__()
@@ -1007,25 +1026,43 @@ class AIMemoryController:
                         c.cfg.spill_min_bytes = max(1 * 1024 * 1024, int(c.cfg.spill_min_bytes * 0.9))
                 c._envelope.end_step(io=c.io)
                 c.pcc.lookahead = int(c.cfg.pcc_lookahead)
-                if c._rank_coord is not None and (c._step_id % max(1, int(getattr(c.cfg, "coordination_interval_steps", 5))) == 0):
+                if ((c._rank_coord is not None) or (c._collective_coord is not None)) and (c._step_id % max(1, int(getattr(c.cfg, "coordination_interval_steps", 5))) == 0):
                     try:
-                        c._rank_coord.publish(c._step_id, c.metrics_snapshot(), topology=(c._topology if bool(getattr(c.cfg, "topology_awareness_enabled", True)) else {}))
-                        if c.rank == int(getattr(c.cfg, "coordination_leader_rank", 0)):
-                            c._rank_coord.leader_aggregate(
+                        if c._collective_coord is not None:
+                            consensus = c._collective_coord.sync_consensus(
                                 c._step_id,
+                                c.metrics_snapshot(),
+                                topology=(c._topology if bool(getattr(c.cfg, "topology_awareness_enabled", True)) else {}),
                                 max_rank_stale_s=float(getattr(c.cfg, "coordination_rank_stale_s", 5.0)),
                                 min_quorum_ratio=float(getattr(c.cfg, "coordination_min_quorum_ratio", 0.75)),
                             )
-                        consensus = c._rank_coord.poll_consensus(max_age_s=float(getattr(c.cfg, "coordination_timeout_s", 1.0)))
-                        if consensus is not None:
-                            applied = c._rank_coord.apply(
-                                c.cfg,
-                                consensus,
-                                anti_skew=bool(getattr(c.cfg, "anti_skew_enabled", True)),
-                                rank=c.rank,
-                            )
-                            if applied:
-                                c.metrics.coord_policy_applied += 1
+                            if consensus is not None:
+                                applied = c._collective_coord.apply(
+                                    c.cfg,
+                                    consensus,
+                                    anti_skew=bool(getattr(c.cfg, "anti_skew_enabled", True)),
+                                    rank=c.rank,
+                                )
+                                if applied:
+                                    c.metrics.coord_policy_applied += 1
+                        elif c._rank_coord is not None:
+                            c._rank_coord.publish(c._step_id, c.metrics_snapshot(), topology=(c._topology if bool(getattr(c.cfg, "topology_awareness_enabled", True)) else {}))
+                            if c.rank == int(getattr(c.cfg, "coordination_leader_rank", 0)):
+                                c._rank_coord.leader_aggregate(
+                                    c._step_id,
+                                    max_rank_stale_s=float(getattr(c.cfg, "coordination_rank_stale_s", 5.0)),
+                                    min_quorum_ratio=float(getattr(c.cfg, "coordination_min_quorum_ratio", 0.75)),
+                                )
+                            consensus = c._rank_coord.poll_consensus(max_age_s=float(getattr(c.cfg, "coordination_timeout_s", 1.0)))
+                            if consensus is not None:
+                                applied = c._rank_coord.apply(
+                                    c.cfg,
+                                    consensus,
+                                    anti_skew=bool(getattr(c.cfg, "anti_skew_enabled", True)),
+                                    rank=c.rank,
+                                )
+                                if applied:
+                                    c.metrics.coord_policy_applied += 1
                     except Exception as e:
                         if c._logger:
                             c._logger.log({"evt": "coord_warn", "err": safe_exc(e)})

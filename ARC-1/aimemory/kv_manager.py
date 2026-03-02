@@ -5,6 +5,7 @@ from typing import Dict, Optional, Tuple, List
 
 import numpy as np
 import torch
+from .kv_backends import load_kv_backend
 
 
 @dataclass
@@ -42,7 +43,9 @@ class KVResidencyManager:
         self.tenant_budget_ratio = float(getattr(cfg, "kv_tenant_budget_ratio", 0.25))
         self.request_budget_ratio = float(getattr(cfg, "kv_request_budget_ratio", 0.20))
         self.overload_drop_prefetch = bool(getattr(cfg, "kv_overload_drop_prefetch", True))
-        self.hard_tenant_cap = bool(getattr(cfg, "kv_hard_tenant_cap", True))
+        self.hard_tenant_cap = bool(getattr(cfg, "kv_hard_tenant_cap", False))
+        self.backend_adapter = load_kv_backend(str(getattr(cfg, "kv_backend_adapter", "")))
+        self.backend_allow_fallback = bool(getattr(cfg, "kv_backend_allow_fallback", True))
 
         self._blocks: Dict[str, KVBlock] = {}
         self._resident_bytes = 0
@@ -180,6 +183,14 @@ class KVResidencyManager:
     def register(self, key: str, tensor: torch.Tensor, tenant_id: str = "default", request_id: str = ""):
         if not self.enabled:
             return False
+        if self.backend_adapter is not None:
+            try:
+                r = self.backend_adapter.register(self, key=key, tensor=tensor, tenant_id=tenant_id, request_id=request_id)
+                if r is not None:
+                    return bool(r)
+            except Exception:
+                if not self.backend_allow_fallback:
+                    return False
         nbytes = int(tensor.numel() * tensor.element_size())
         tid = str(tenant_id or "default")
         tb = self._tenant_budget(tid)
@@ -226,6 +237,14 @@ class KVResidencyManager:
     def get(self, key: str, token_latency_ms: Optional[float] = None) -> Optional[torch.Tensor]:
         if not self.enabled:
             return None
+        if self.backend_adapter is not None:
+            try:
+                r = self.backend_adapter.get(self, key=key, token_latency_ms=token_latency_ms)
+                if r is not None:
+                    return r
+            except Exception:
+                if not self.backend_allow_fallback:
+                    return None
         if token_latency_ms is not None:
             self._token_latency_ms.append(float(token_latency_ms))
             if len(self._token_latency_ms) > 8192:
@@ -263,6 +282,14 @@ class KVResidencyManager:
         """
         if (not self.enabled) or self.phase != "decode":
             return
+        if self.backend_adapter is not None:
+            try:
+                r = self.backend_adapter.on_decode_tick(self, next_keys=next_keys)
+                if r is not None:
+                    return
+            except Exception:
+                if not self.backend_allow_fallback:
+                    return
         lookahead = max(1, int(self.decode_lookahead))
         if self.overload_drop_prefetch and self._token_latency_p(99) > self.latency_slo_ms:
             lookahead = 1
@@ -273,6 +300,14 @@ class KVResidencyManager:
             self.get(k)
 
     def release(self, key: str):
+        if self.backend_adapter is not None:
+            try:
+                r = self.backend_adapter.release(self, key=key)
+                if r is not None:
+                    return
+            except Exception:
+                if not self.backend_allow_fallback:
+                    return
         b = self._blocks.pop(key, None)
         if b is None:
             return
@@ -310,4 +345,9 @@ class KVResidencyManager:
             "prefetch_lookahead": int(self.prefill_lookahead if self.phase == "prefill" else self.decode_lookahead),
             "token_latency_p95_ms": self._token_latency_p(95),
             "token_latency_p99_ms": self._token_latency_p(99),
+            "backend_adapter": (
+                self.backend_adapter.stats()
+                if (self.backend_adapter is not None and hasattr(self.backend_adapter, "stats"))
+                else {"backend": ("custom" if self.backend_adapter is not None else "internal")}
+            ),
         }

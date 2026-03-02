@@ -5,6 +5,9 @@ from aimemory.installer import run_installer
 from aimemory.bench.bench import run_bench
 from aimemory.bench.headroom_gate import run_headroom_gate
 from aimemory.bench.qualification import run_qualification
+from aimemory.bench.compile_matrix import run_compile_matrix
+from aimemory.bench.parity_longrun import run_parity_longrun
+from aimemory.bench.fastpath_qual import run_fastpath_qualification
 from aimemory.gc import gc_old_windows
 from aimemory.support_bundle import build_support_bundle
 from aimemory.consistency import run_consistency_check
@@ -22,6 +25,9 @@ from aimemory.admission import AdmissionController, JobRequest, load_node_profil
 from aimemory.parity_cert import certify_from_files
 from aimemory.policy_model import MemoryPolicyModel
 from aimemory.ship_assets import build_ga_readiness, build_commercial_pack
+from aimemory.security_ops import generate_threat_model, security_audit, rotate_key_with_audit, write_json_report
+from aimemory.migration import write_migration_report, build_migration_report
+from aimemory.claims import build_claims_evidence, write_claims_evidence
 
 def main():
     p = argparse.ArgumentParser(prog="arc1")
@@ -55,6 +61,24 @@ def main():
     q.add_argument("--out", default="./aimemory_qualification.json")
     q.add_argument("--threshold-multiplier", type=float, default=3.0)
     q.add_argument("--overhead-sla-pct", type=float, default=15.0)
+
+    cm = sub.add_parser("compile-matrix")
+    cm.add_argument("--out", default="./arc1_compile_matrix.json")
+    cm.add_argument("--dims", default="512,1024")
+    cm.add_argument("--dtypes", default="float16,bfloat16")
+    cm.add_argument("--steps", type=int, default=4)
+
+    pl = sub.add_parser("parity-longrun")
+    pl.add_argument("--pool-dir", default="/mnt/nvme_pool")
+    pl.add_argument("--out", default="./arc1_parity_longrun.json")
+    pl.add_argument("--steps", type=int, default=64)
+    pl.add_argument("--dim", type=int, default=1024)
+    pl.add_argument("--dtype", default="float16")
+
+    fq = sub.add_parser("fastpath-qualify")
+    fq.add_argument("--pool-dir", default="/mnt/nvme_pool")
+    fq.add_argument("--out", default="./arc1_fastpath_qualification.json")
+    fq.add_argument("--probe-mb", type=int, default=64)
 
     g = sub.add_parser("gc")
     g.add_argument("--pool-dir", default="/mnt/nvme_pool")
@@ -198,6 +222,32 @@ def main():
     cp.add_argument("--out-dir", default="./arc1_commercial_pack")
     cp.add_argument("--customer", default="")
 
+    mr = sub.add_parser("migration-report")
+    mr.add_argument("--path", default=".")
+    mr.add_argument("--out", default="")
+    mr.add_argument("--rewrite", action="store_true")
+
+    sa = sub.add_parser("security-audit")
+    sa.add_argument("--pool-dir", default="/mnt/nvme_pool")
+    sa.add_argument("--key-path", default="")
+    sa.add_argument("--audit-path", default="")
+    sa.add_argument("--out", default="")
+
+    stm = sub.add_parser("security-threat-model")
+    stm.add_argument("--out", default="./arc1_threat_model.json")
+
+    srk = sub.add_parser("security-rotate-key")
+    srk.add_argument("--key-path", required=True)
+    srk.add_argument("--new-key-path", default="")
+    srk.add_argument("--audit-path", default="")
+
+    ce = sub.add_parser("claims-evidence")
+    ce.add_argument("--qualification", default="")
+    ce.add_argument("--fastpath", default="")
+    ce.add_argument("--benchmark", default="")
+    ce.add_argument("--out", default="")
+    ce.add_argument("--no-require-cuda", action="store_true")
+
     spc = sub.add_parser("static-plan-compile")
     spc.add_argument("--pool-dir", default="/mnt/nvme_pool")
     spc.add_argument("--name", default="default")
@@ -248,6 +298,26 @@ def main():
             threshold_multiplier=args.threshold_multiplier,
             overhead_sla_pct=args.overhead_sla_pct,
         )
+        return 0
+    if args.cmd == "compile-matrix":
+        dims = [int(x.strip()) for x in str(args.dims).split(",") if x.strip()]
+        dtypes = [str(x.strip()) for x in str(args.dtypes).split(",") if x.strip()]
+        rep = run_compile_matrix(out_path=args.out, dims=dims, dtypes=dtypes, steps=int(args.steps))
+        print(json.dumps(rep, indent=2))
+        return 0
+    if args.cmd == "parity-longrun":
+        rep = run_parity_longrun(
+            pool_dir=args.pool_dir,
+            out_path=args.out,
+            steps=int(args.steps),
+            dim=int(args.dim),
+            dtype_s=str(args.dtype),
+        )
+        print(json.dumps(rep, indent=2))
+        return 0
+    if args.cmd == "fastpath-qualify":
+        rep = run_fastpath_qualification(pool_dir=args.pool_dir, out_path=args.out, probe_mb=int(args.probe_mb))
+        print(json.dumps(rep, indent=2))
         return 0
     if args.cmd == "gc":
         r = gc_old_windows(
@@ -456,6 +526,47 @@ def main():
             out_dir=str(args.out_dir),
             customer=str(args.customer),
         )
+        print(json.dumps(rep, indent=2))
+        return 0
+    if args.cmd == "migration-report":
+        if args.out:
+            rep = write_migration_report(root=str(args.path), out_path=str(args.out), rewrite=bool(args.rewrite))
+        else:
+            rep = build_migration_report(root=str(args.path), rewrite=bool(args.rewrite))
+        print(json.dumps(rep, indent=2))
+        return 0
+    if args.cmd == "security-threat-model":
+        rep = generate_threat_model(product="ARC-1")
+        if args.out:
+            write_json_report(rep, args.out)
+        print(json.dumps(rep, indent=2))
+        return 0
+    if args.cmd == "security-audit":
+        rep = security_audit(pool_dir=args.pool_dir, key_path=str(args.key_path), audit_path=str(args.audit_path))
+        if args.out:
+            write_json_report(rep, args.out)
+        print(json.dumps(rep, indent=2))
+        return 0
+    if args.cmd == "security-rotate-key":
+        rep = rotate_key_with_audit(key_path=str(args.key_path), new_key_path=str(args.new_key_path), audit_path=str(args.audit_path))
+        print(json.dumps(rep, indent=2))
+        return 0
+    if args.cmd == "claims-evidence":
+        if args.out:
+            rep = write_claims_evidence(
+                out_path=str(args.out),
+                qualification_path=str(args.qualification),
+                fastpath_path=str(args.fastpath),
+                benchmark_path=str(args.benchmark),
+                require_cuda_evidence=(not bool(args.no_require_cuda)),
+            )
+        else:
+            rep = build_claims_evidence(
+                qualification_path=str(args.qualification),
+                fastpath_path=str(args.fastpath),
+                benchmark_path=str(args.benchmark),
+                require_cuda_evidence=(not bool(args.no_require_cuda)),
+            )
         print(json.dumps(rep, indent=2))
         return 0
     if args.cmd == "static-plan-compile":

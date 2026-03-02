@@ -307,6 +307,120 @@ def main():
         j13 = json.loads(out13)
         assert os.path.exists(j13["json"])
         assert os.path.exists(j13["markdown"])
+
+        out14 = _run(
+            [
+                ".venv/bin/python",
+                "-m",
+                "arc1",
+                "compile-matrix",
+                "--out",
+                os.path.join(td, "compile_matrix.json"),
+                "--dims",
+                "64",
+                "--dtypes",
+                "float32",
+                "--steps",
+                "2",
+            ]
+        )
+        j14 = json.loads(out14)
+        assert "rows" in j14
+
+        out15 = _run(
+            [
+                ".venv/bin/python",
+                "-m",
+                "arc1",
+                "parity-longrun",
+                "--pool-dir",
+                td,
+                "--out",
+                os.path.join(td, "parity_longrun.json"),
+                "--steps",
+                "4",
+                "--dim",
+                "64",
+                "--dtype",
+                "float32",
+            ]
+        )
+        j15 = json.loads(out15)
+        assert "parity" in j15
+
+        out16 = _run(
+            [
+                ".venv/bin/python",
+                "-m",
+                "arc1",
+                "fastpath-qualify",
+                "--pool-dir",
+                td,
+                "--out",
+                os.path.join(td, "fastpath.json"),
+                "--probe-mb",
+                "4",
+            ]
+        )
+        j16 = json.loads(out16)
+        assert "backend_capabilities" in j16
+
+        out17 = _run(
+            [
+                ".venv/bin/python",
+                "-m",
+                "arc1",
+                "migration-report",
+                "--path",
+                td,
+            ]
+        )
+        j17 = json.loads(out17)
+        assert "scanned_files" in j17
+
+        out18 = _run(
+            [
+                ".venv/bin/python",
+                "-m",
+                "arc1",
+                "security-threat-model",
+                "--out",
+                os.path.join(td, "threat_model.json"),
+            ]
+        )
+        j18 = json.loads(out18)
+        assert "assets" in j18
+
+        out19 = _run(
+            [
+                ".venv/bin/python",
+                "-m",
+                "arc1",
+                "security-audit",
+                "--pool-dir",
+                td,
+            ]
+        )
+        j19 = json.loads(out19)
+        assert "stage" in j19
+
+        out20 = _run(
+            [
+                ".venv/bin/python",
+                "-m",
+                "arc1",
+                "claims-evidence",
+                "--qualification",
+                os.path.join(td, "qualification.json"),
+                "--fastpath",
+                os.path.join(td, "fastpath.json"),
+                "--out",
+                os.path.join(td, "claims.json"),
+                "--no-require-cuda",
+            ]
+        )
+        j20 = json.loads(out20)
+        assert "status" in j20
     print("CLI_NEW_FEATURES_OK")
 
 
