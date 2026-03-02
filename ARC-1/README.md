@@ -69,6 +69,8 @@ for _ in range(1000):
 - `arc1 compile-matrix --out ./arc1_compile_matrix.json`
 - `arc1 parity-longrun --pool-dir /mnt/nvme_pool --out ./arc1_parity_longrun.json`
 - `arc1 fastpath-qualify --pool-dir /mnt/nvme_pool --out ./arc1_fastpath_qualification.json`
+- `arc1 qualify --suite golden_llm_train --pool-dir /mnt/nvme_pool --out-dir ./arc1_golden_train`
+- `arc1 qualify --suite golden_llm_infer_kv --pool-dir /mnt/nvme_pool --out-dir ./arc1_golden_infer`
 - `arc1 migration-report --path . --out ./arc1_migration_report.json`
 - `arc1 security-threat-model --out ./arc1_threat_model.json`
 - `arc1 security-audit --pool-dir /mnt/nvme_pool --out ./arc1_security_audit.json`

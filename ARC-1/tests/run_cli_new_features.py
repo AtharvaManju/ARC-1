@@ -421,6 +421,24 @@ def main():
         )
         j20 = json.loads(out20)
         assert "status" in j20
+
+        out21 = _run(
+            [
+                ".venv/bin/python",
+                "-m",
+                "arc1",
+                "qualify",
+                "--suite",
+                "golden_llm_infer_kv",
+                "--pool-dir",
+                td,
+                "--out-dir",
+                os.path.join(td, "golden"),
+            ]
+        )
+        j21 = json.loads(out21)
+        assert os.path.exists(j21["summary_markdown"])
+        assert os.path.exists(j21["artifacts_jsonl"])
     print("CLI_NEW_FEATURES_OK")
 
 

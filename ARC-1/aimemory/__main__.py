@@ -5,6 +5,7 @@ from aimemory.installer import run_installer
 from aimemory.bench.bench import run_bench
 from aimemory.bench.headroom_gate import run_headroom_gate
 from aimemory.bench.qualification import run_qualification
+from aimemory.golden_pack import run_golden_qualification_pack
 from aimemory.bench.compile_matrix import run_compile_matrix
 from aimemory.bench.parity_longrun import run_parity_longrun
 from aimemory.bench.fastpath_qual import run_fastpath_qualification
@@ -59,6 +60,8 @@ def main():
     q = sub.add_parser("qualify")
     q.add_argument("--pool-dir", default="/mnt/nvme_pool")
     q.add_argument("--out", default="./aimemory_qualification.json")
+    q.add_argument("--out-dir", default="")
+    q.add_argument("--suite", default="")
     q.add_argument("--threshold-multiplier", type=float, default=3.0)
     q.add_argument("--overhead-sla-pct", type=float, default=15.0)
 
@@ -292,6 +295,15 @@ def main():
         )
         return 0
     if args.cmd == "qualify":
+        if str(args.suite).strip():
+            rep = run_golden_qualification_pack(
+                pool_dir=args.pool_dir,
+                suite=str(args.suite),
+                out_dir=str(args.out_dir),
+                overhead_sla_pct=float(args.overhead_sla_pct),
+            )
+            print(json.dumps(rep, indent=2))
+            return 0
         run_qualification(
             pool_dir=args.pool_dir,
             out_path=args.out,
