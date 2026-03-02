@@ -1,0 +1,11 @@
+include README.md
+include requirements.txt
+include pyproject.toml
+include setup.py
+include setup_engine.py
+include sarc_engine.cpp
+recursive-include aimemory *.py
+recursive-include aimemory_engine *.py
+recursive-include examples *.py
+recursive-include scripts *.sh
+recursive-include tests *.py
