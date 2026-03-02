@@ -13,6 +13,7 @@ class AIMemoryConfig:
     max_queue: int = 4096
     queue_put_timeout_s: float = 0.01
     spill_queue_overflow_policy: str = "SYNC_SPILL"  # BLOCK | SYNC_SPILL | DISABLE_SPILLING
+    pack_wait_for_commit: bool = False
 
     pinned_pool_bytes: int = 2 * 1024**3
     prefetch_stream_priority: int = -1

@@ -64,6 +64,7 @@ def _can_run(batch: int, dim: int, steps: int, warmup: int, dtype: torch.dtype, 
                 pcc_lookahead=4,
                 queue_put_timeout_s=0.01,
                 spill_queue_overflow_policy="SYNC_SPILL",
+                pack_wait_for_commit=True,
                 sync_each_step=True,
             )
             ctrl = AIMemoryController(cfg)

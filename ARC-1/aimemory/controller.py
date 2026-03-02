@@ -288,6 +288,12 @@ class AIMemoryController:
                 self._step_keys_by_pack.pop(pack_idx, None)
                 return PackedRef(kind="INLINE", pack_idx=pack_idx, tensor=t)
 
+        if bool(getattr(self.cfg, "pack_wait_for_commit", False)):
+            done_evt.wait()
+            fatal = self.io.fatal_error()
+            if fatal is not None:
+                raise RuntimeError(f"AIMemory spill commit failed for key={key}: {fatal}")
+
         self.metrics.spills += 1
         self.metrics.spill_bytes += nbytes
         return PackedRef(kind="SPILLED", pack_idx=pack_idx, key=key, dtype_s=dtype_s, shape=shape, nbytes=nbytes)
@@ -314,6 +320,9 @@ class AIMemoryController:
             done_evt.wait()
             dt_ms = (time.time() - t0) * 1000.0
             self.metrics.spill_commit_wait_ms_ema.update(dt_ms)
+            fatal = self.io.fatal_error()
+            if fatal is not None:
+                raise RuntimeError(f"AIMemory spill commit failed for key={key}: {fatal}")
 
         out = None
         try:
@@ -326,7 +335,13 @@ class AIMemoryController:
                 self.metrics.prefetch_hits += 1
             else:
                 self.metrics.prefetch_misses += 1
-                meta = self.storage.get_meta(key)
+                try:
+                    meta = self.storage.get_meta(key)
+                except KeyError as e:
+                    fatal = self.io.fatal_error()
+                    if fatal is not None:
+                        raise RuntimeError(f"AIMemory spill commit failed for key={key}: {fatal}") from e
+                    raise
 
                 enc_blk = None
                 scratch = None
