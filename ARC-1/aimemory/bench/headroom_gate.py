@@ -51,7 +51,7 @@ def _train_step(model, opt, batch: int, dim: int, dtype: torch.dtype):
 
 
 def _can_run(batch: int, dim: int, steps: int, warmup: int, dtype: torch.dtype, use_aimemory: bool, pool_dir: str):
-    model = _Toy(dim).cuda().train()
+    model = _Toy(dim).to(device="cuda", dtype=dtype).train()
     opt = optim.AdamW(model.parameters(), lr=1e-3)
     ctrl = None
     try:
